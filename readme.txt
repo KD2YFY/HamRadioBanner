@@ -1,5 +1,5 @@
 =====================================================
-          MISSION CONTROL HUD - KB2LFZ
+          MISSION CONTROL HUD
 =====================================================
 
 A transparent, movable, and resizable desktop banner 
@@ -47,4 +47,5 @@ python banner.py
 - RESIZE: Click and drag the bottom-right corner.
 - CLOSE: Close the terminal window running the 
          script.
+
 =====================================================
