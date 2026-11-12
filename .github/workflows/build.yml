@@ -34,6 +34,16 @@ jobs:
       - uses: actions/setup-python@v5
         with:
           python-version: "3.12"
+      - name: Check version number matches banner.py
+        if: github.ref_type == 'tag' || inputs.version != ''
+        shell: bash
+        run: |
+          WANT="${{ github.ref_type == 'tag' && github.ref_name || inputs.version }}"
+          HAVE=$(sed -n 's/^__version__ = "\([^"]*\)".*/\1/p' banner.py)
+          if [ "${WANT#v}" != "$HAVE" ]; then
+            echo "::error::You asked to release $WANT but banner.py says __version__ = \"$HAVE\". Update banner.py first."
+            exit 1
+          fi
       - run: pip install -r requirements.txt pyinstaller
       - run: pyinstaller --noconfirm --windowed --onedir --name HamRadioBanner banner.py
       - name: Zip

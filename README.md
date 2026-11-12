@@ -74,6 +74,15 @@ All settings can be changed from **Right-click → Settings…**:
 
 Settings are saved to `config.ini` next to the program. You can also edit that file in a text editor; changes (such as a different operator's callsign) show up within a second, no restart needed. If you installed with pipx or use the Mac app, `config.ini` is kept in your user settings folder instead. See `config.example.ini` for the format.
 
+## Updating
+
+The banner checks for a new version once a day. When one is out, **⬆ Update available** appears on the banner. To update:
+
+1. **Right-click → Download update…** This opens the Releases page.
+2. Download the new zip and unzip it over your old folder.
+
+Your settings in `config.ini` are kept. If you use the launcher (Option B), download the new code the same way. If you installed with pipx, run `pipx upgrade hamradiobanner`.
+
 ## Credits
 
 Weather from [Open-Meteo](https://open-meteo.com/). Automatic location from [ip-api.com](https://ip-api.com/).
@@ -81,6 +90,8 @@ Weather from [Open-Meteo](https://open-meteo.com/). Automatic location from [ip-
 ---
 
 ### For the maintainer: publishing a release
+
+First change `__version__` near the top of `banner.py` to the new number (e.g. `"1.2.0"`) and commit it. The build stops with an error if that number doesn't match the version you release.
 
 The **Build apps** GitHub Action builds the Windows, macOS and Linux downloads and puts them on the Releases page. To publish a new version: go to the **Actions** tab, pick **Build apps**, click **Run workflow**, enter a version such as `v1.2.0`, and click the green button. Pushing a version tag does the same:
 

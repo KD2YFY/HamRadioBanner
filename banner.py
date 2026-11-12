@@ -8,15 +8,18 @@ import sys
 import threading
 
 import requests
-from PyQt6.QtCore import QDateTime, QFileSystemWatcher, QPoint, QStandardPaths, Qt, QTimer, QTimeZone, pyqtSignal
-from PyQt6.QtGui import QAction, QColor, QFont, QIcon, QPainter, QPixmap
+from PyQt6.QtCore import QDateTime, QUrl, QFileSystemWatcher, QPoint, QStandardPaths, Qt, QTimer, QTimeZone, pyqtSignal
+from PyQt6.QtGui import QAction, QColor, QDesktopServices, QFont, QIcon, QPainter, QPixmap
 from PyQt6.QtWidgets import (
     QApplication, QComboBox, QCompleter, QDialog, QDialogButtonBox, QFormLayout, QHBoxLayout,
     QLabel, QLineEdit, QMenu, QMessageBox, QSizeGrip, QSpinBox, QSystemTrayIcon, QVBoxLayout,
     QWidget,
 )
 
+__version__ = "1.1.1"  # must match the version typed when publishing a release
 APP_NAME = "HamRadioBanner"
+RELEASES_API = "https://api.github.com/repos/KD2YFY/HamRadioBanner/releases/latest"
+RELEASES_PAGE = "https://github.com/KD2YFY/HamRadioBanner/releases/latest"
 DEFAULTS = {
     "callsign": "N0CALL",
     "timezone": "",           # blank = use the computer's timezone
@@ -150,6 +153,26 @@ def fetch_weather(location, units):
             f"<span style='color:#5fafff;'>L:{round(lo)}°</span>")
 
 
+# ---------------------------------------------------------------- update ---
+
+def _version_tuple(v):
+    """'v1.2.3' -> (1, 2, 3); anything unparseable -> ()"""
+    try:
+        return tuple(int(x) for x in v.strip().lstrip("vV").split("."))
+    except ValueError:
+        return ()
+
+
+def check_for_update():
+    """Return (version, url) of a newer GitHub release, or None."""
+    res = requests.get(RELEASES_API, timeout=10,
+                       headers={"Accept": "application/vnd.github+json"}).json()
+    latest = res.get("tag_name", "")
+    if _version_tuple(latest) > _version_tuple(__version__):
+        return latest, res.get("html_url") or RELEASES_PAGE
+    return None
+
+
 # -------------------------------------------------------------- settings ---
 
 class SettingsDialog(QDialog):
@@ -234,6 +257,7 @@ def _int(value, default):
 
 class MissionControlBanner(QWidget):
     weather_ready = pyqtSignal(str)
+    update_found = pyqtSignal(str, str)
 
     def __init__(self, config):
         super().__init__()
@@ -277,8 +301,23 @@ class MissionControlBanner(QWidget):
         self.menu = QMenu()
         self.menu.addAction("Settings…", self.open_settings)
         self.menu.addAction("Refresh Weather", self.get_weather)
+        self.update_url = RELEASES_PAGE
+        self.update_action = QAction("Download update", self)
+        self.update_action.triggered.connect(lambda: QDesktopServices.openUrl(QUrl(self.update_url)))
+        self.update_action.setVisible(False)
+        self.menu.addAction(self.update_action)
         self.menu.addSeparator()
+        about = self.menu.addAction(f"Version {__version__}")
+        about.setEnabled(False)
         self.menu.addAction("Quit", QApplication.instance().quit)
+        self.update_text = ""
+
+        # Check GitHub for a newer release shortly after start, then once a day.
+        self.update_found.connect(self._on_update_found)
+        self.update_timer = QTimer(self)
+        self.update_timer.timeout.connect(self.check_update)
+        self.update_timer.start(24 * 60 * 60 * 1000)
+        QTimer.singleShot(5000, self.check_update)
 
         self.weather_ready.connect(self._on_weather)
         self.clock_timer = QTimer(self)
@@ -328,6 +367,26 @@ class MissionControlBanner(QWidget):
             self.apply_settings()
 
     # --- weather (runs in background so the clock never freezes) ---
+    def check_update(self):
+        def work():
+            try:
+                found = check_for_update()
+            except Exception as e:  # offline, GitHub down, rate-limited... try again tomorrow
+                print(f"Update check failed: {e}", file=sys.stderr)
+                return
+            if found:
+                self.update_found.emit(*found)
+
+        threading.Thread(target=work, daemon=True).start()
+
+    def _on_update_found(self, version, url):
+        self.update_url = url
+        self.update_action.setText(f"Download update ({version})…")
+        self.update_action.setVisible(True)
+        self.update_text = ("<span style='color:#E6A23C; font-size:11px;'> &nbsp;⬆ Update available "
+                            "(right-click)</span>")
+        self.update_display()
+
     def get_weather(self):
         if self._fetching:
             return
@@ -365,7 +424,7 @@ class MissionControlBanner(QWidget):
             <span style='color: #E6A23C; font-size: 24px;'> {local_dt.toString("hh:mm:ss")} </span> &nbsp;&nbsp;
             <span style='color: #67C23A; font-size: 11px;'>WX</span>
             <span style='color: white; font-size: 18px;'> {self.weather_info} </span>
-            {warn}
+            {warn}{self.update_text}
         </div>
         """)
 
@@ -454,6 +513,7 @@ def main():
         tray_menu.addAction(show)
         tray_menu.addAction("Settings…", banner.open_settings)
         tray_menu.addAction("Refresh Weather", banner.get_weather)
+        tray_menu.addAction(banner.update_action)
         tray_menu.addSeparator()
         tray_menu.addAction("Quit", app.quit)
         tray.setContextMenu(tray_menu)
