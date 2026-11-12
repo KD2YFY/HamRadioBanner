@@ -1,10 +1,16 @@
-# Builds ready-to-run apps (no Python needed) for Windows, macOS and Linux.
-# Run it from the Actions tab ("Run workflow"), or push a tag like v1.1.0 to
-# attach the downloads to a GitHub Release automatically.
+# Builds ready-to-run apps (no Python needed) for Windows, macOS and Linux
+# and publishes them on the Releases page.
+# To make a new release: Actions tab > "Build apps" > "Run workflow" > enter a
+# version like v1.2.0. (Pushing a tag like v1.2.0 does the same thing.)
 name: Build apps
 
 on:
   workflow_dispatch:
+    inputs:
+      version:
+        description: "Version to release, e.g. v1.2.0 (leave blank to only build)"
+        required: false
+        default: ""
   push:
     tags: ["v*"]
 
@@ -46,7 +52,21 @@ jobs:
         with:
           name: ${{ matrix.name }}
           path: ${{ matrix.name }}.zip
-      - uses: softprops/action-gh-release@v2
-        if: startsWith(github.ref, 'refs/tags/')
+
+  release:
+    needs: build
+    if: github.ref_type == 'tag' || inputs.version != ''
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/download-artifact@v4
         with:
-          files: ${{ matrix.name }}.zip
+          merge-multiple: true
+      - uses: softprops/action-gh-release@v2
+        with:
+          tag_name: ${{ github.ref_type == 'tag' && github.ref_name || inputs.version }}
+          target_commitish: ${{ github.sha }}
+          name: Ham Radio Banner ${{ github.ref_type == 'tag' && github.ref_name || inputs.version }}
+          body: |
+            Download the zip for your computer, unzip it, and double-click **HamRadioBanner**.
+            No Python needed. See the README for first-run tips.
+          files: HamRadioBanner-*.zip

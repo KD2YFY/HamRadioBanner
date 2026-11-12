@@ -82,7 +82,7 @@ Weather from [Open-Meteo](https://open-meteo.com/). Automatic location from [ip-
 
 ### For the maintainer: publishing a release
 
-The **Build apps** GitHub Action builds the Windows, macOS and Linux downloads. You can start it from the **Actions** tab with **Run workflow**, which puts the zips under the run's artifacts. Or push a version tag, which attaches the zips to a new Release automatically:
+The **Build apps** GitHub Action builds the Windows, macOS and Linux downloads and puts them on the Releases page. To publish a new version: go to the **Actions** tab, pick **Build apps**, click **Run workflow**, enter a version such as `v1.2.0`, and click the green button. Pushing a version tag does the same:
 
 ```bash
 git tag v1.1.0
