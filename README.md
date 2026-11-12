@@ -1,54 +1,91 @@
-# HamRadioBanner
-A Simple Ham Radio Banner using Python - Vibe Coded with Gemini. Callsign/UTC/Local/WX information. Resizeable and moveable
+# Ham Radio Banner
 
-=====================================================
-          MISSION CONTROL HUD
-=====================================================
+A small always-on-top desktop banner for your shack. It shows your **callsign**, **UTC time**, **local time** and **live weather**. You can move and resize it.
 
-A transparent, movable, and resizable desktop banner 
-displaying UTC time, Local time, and live weather.
+```
+W1AW   UTC 13:00:36   2026-11-12   New York 08:00:36   WX Albany 51° H:60° L:40°
+```
 
------------------------------------------------------
-1. PREREQUISITES
------------------------------------------------------
-You must have Python 3.9 or newer installed on your 
-system. You can download it from python.org.
+---
 
------------------------------------------------------
-2. INSTALLATION
------------------------------------------------------
-Open your terminal (Command Prompt or PowerShell) and 
-run the following command to install the required 
-libraries:
+## Install
 
-python -m pip install PyQt6 requests
+Pick **one** of these options.
 
------------------------------------------------------
-3. CONFIGURATION (config.ini)
------------------------------------------------------
-Before running the script, ensure there is a file 
-named 'config.ini' in the same folder. 
+### Option A: Download the app (easiest, no Python needed)
 
-Open 'config.ini' in a text editor (like Notepad) 
-to customize:
-- callsign: Your Amateur Radio callsign.
-- timezone: Your local timezone (e.g., America/New_York).
-- weather_refresh: How often to update weather (in mins).
+1. Go to the [**Releases**](../../releases) page.
+2. Download the zip for your computer: `HamRadioBanner-Windows.zip`, `HamRadioBanner-macOS.zip` or `HamRadioBanner-Linux.zip`.
+3. Unzip it and double-click **HamRadioBanner**.
 
------------------------------------------------------
-4. HOW TO RUN
------------------------------------------------------
-Double-click 'banner.py' or run via terminal:
+> **Windows:** if SmartScreen says "Windows protected your PC", click **More info → Run anyway**.
+> **Mac:** the first time, right-click the app, choose **Open**, then click **Open** again.
 
-python banner.py
+### Option B: Double-click launcher (needs Python 3.9+)
 
------------------------------------------------------
-5. CONTROLS
------------------------------------------------------
-- MOVE: Click and hold anywhere on the dark 
-        background and drag.
-- RESIZE: Click and drag the bottom-right corner.
-- CLOSE: Close the terminal window running the 
-         script.
+1. Install Python from [python.org](https://www.python.org/downloads/). On Windows, tick **"Add python.exe to PATH"** during install.
+2. Download this project with the green **Code → Download ZIP** button and unzip it.
+3. Double-click the launcher for your system:
+   - **Windows:** `Start Banner (Windows).bat`
+   - **Mac:** `Start Banner (Mac).command`
+   - **Linux:** `./start_banner.sh`
 
-=====================================================
+The first launch takes about a minute because it installs what the banner needs. Later launches are instant.
+
+### Option C: For Python users
+
+```bash
+pipx install git+https://github.com/KD2YFY/HamRadioBanner.git
+```
+
+```bash
+hamradiobanner
+```
+
+---
+
+## First run
+
+On first run, a small window asks for your **callsign**. Your timezone is detected automatically, and so is your weather location. Click **Save** and you're done.
+
+## Using it
+
+| To…                       | Do this                                                  |
+|---------------------------|----------------------------------------------------------|
+| Move it                   | Click and drag anywhere on the banner                    |
+| Resize it                 | Drag the bottom-right corner                             |
+| Change settings           | **Right-click → Settings…** (or double-click the banner) |
+| Update the weather now    | **Right-click → Refresh Weather**                        |
+| Quit                      | **Right-click → Quit**, or use the tray icon             |
+
+The banner remembers its position and size between runs. A tray icon (**HR**) also appears in your system tray or menu bar, so you can find the banner or quit it.
+
+## Settings
+
+All settings can be changed from **Right-click → Settings…**:
+
+- **Callsign:** your amateur radio callsign.
+- **Local timezone:** start typing to search, e.g. `New_York` or `London`.
+- **Weather location:** leave blank to detect it automatically. You can also enter a place like `Albany, NY` or `London, United Kingdom`, or coordinates like `42.65, -73.75`.
+- **Temperature:** °F or °C.
+- **Weather refresh:** how often to update, in minutes.
+
+Settings are saved to `config.ini` next to the program. If you installed with pipx or use the Mac app, they go in your user settings folder instead. See `config.example.ini` for the format.
+
+## Credits
+
+Weather from [Open-Meteo](https://open-meteo.com/). Automatic location from [ip-api.com](https://ip-api.com/).
+
+---
+
+### For the maintainer: publishing a release
+
+The **Build apps** GitHub Action builds the Windows, macOS and Linux downloads. You can start it from the **Actions** tab with **Run workflow**, which puts the zips under the run's artifacts. Or push a version tag, which attaches the zips to a new Release automatically:
+
+```bash
+git tag v1.1.0
+```
+
+```bash
+git push origin v1.1.0
+```

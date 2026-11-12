@@ -1,0 +1,52 @@
+# Builds ready-to-run apps (no Python needed) for Windows, macOS and Linux.
+# Run it from the Actions tab ("Run workflow"), or push a tag like v1.1.0 to
+# attach the downloads to a GitHub Release automatically.
+name: Build apps
+
+on:
+  workflow_dispatch:
+  push:
+    tags: ["v*"]
+
+permissions:
+  contents: write
+
+jobs:
+  build:
+    strategy:
+      matrix:
+        include:
+          - os: windows-latest
+            name: HamRadioBanner-Windows
+          - os: macos-latest
+            name: HamRadioBanner-macOS
+          - os: ubuntu-latest
+            name: HamRadioBanner-Linux
+    runs-on: ${{ matrix.os }}
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+      - run: pip install -r requirements.txt pyinstaller
+      - run: pyinstaller --noconfirm --windowed --onedir --name HamRadioBanner banner.py
+      - name: Zip
+        shell: bash
+        run: |
+          cp config.example.ini README.md dist/
+          cd dist
+          if [ "$RUNNER_OS" = "Windows" ]; then
+            7z a ../${{ matrix.name }}.zip HamRadioBanner config.example.ini README.md
+          elif [ "$RUNNER_OS" = "macOS" ]; then
+            ditto -c -k --keepParent HamRadioBanner.app ../${{ matrix.name }}.zip
+          else
+            zip -r ../${{ matrix.name }}.zip HamRadioBanner config.example.ini README.md
+          fi
+      - uses: actions/upload-artifact@v4
+        with:
+          name: ${{ matrix.name }}
+          path: ${{ matrix.name }}.zip
+      - uses: softprops/action-gh-release@v2
+        if: startsWith(github.ref, 'refs/tags/')
+        with:
+          files: ${{ matrix.name }}.zip

@@ -1,0 +1,8 @@
+# Your personal settings (created on first run)
+config.ini
+.venv/
+__pycache__/
+build/
+dist/
+*.spec
+*.egg-info/
