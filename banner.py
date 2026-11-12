@@ -16,7 +16,7 @@ from PyQt6.QtWidgets import (
     QWidget,
 )
 
-__version__ = "1.1.1"  # must match the version typed when publishing a release
+__version__ = "1.1.2"  # must match the version typed when publishing a release
 APP_NAME = "HamRadioBanner"
 RELEASES_API = "https://api.github.com/repos/KD2YFY/HamRadioBanner/releases/latest"
 RELEASES_PAGE = "https://github.com/KD2YFY/HamRadioBanner/releases/latest"
@@ -100,9 +100,33 @@ US_STATES = dict(s.split(":") for s in (
     "WI:Wisconsin WY:Wyoming DC:District_of_Columbia PR:Puerto_Rico"
 ).split())
 
+class LocationNotFound(ValueError):
+    pass
+
+
+def _search_candidates(text):
+    """Ways to split a place into (name to search, [state/country hints]).
+    'Albany, NY' -> ('Albany', ['NY']).  Without commas, try trailing words as the
+    hint: 'Warrensburg NY' -> ('Warrensburg NY', []), ('Warrensburg', ['NY'])."""
+    if "," in text:
+        parts = [p.strip() for p in text.split(",")]
+        yield parts[0], [p for p in parts[1:] if p]
+        return
+    words = text.split()
+    yield text, []
+    for i in range(len(words) - 1, 0, -1):
+        yield " ".join(words[:i]), [" ".join(words[i:])]
+
+
+def _matches(result, hints):
+    fields = {str(result.get(k, "")).lower() for k in ("admin1", "country", "country_code")}
+    return all(US_STATES.get(h.upper(), h).replace("_", " ").lower() in fields for h in hints)
+
+
 def lookup_location(text):
-    """Return (lat, lon, name). text may be blank (IP lookup), 'lat, lon', or a place name."""
-    text = text.strip()
+    """Return (lat, lon, name). text may be blank (IP lookup), 'lat, lon', a place name
+    like 'Albany, NY' / 'Warrensburg NY' / 'London, United Kingdom', or a postal code."""
+    text = " ".join(text.split())
     if not text:
         loc = requests.get("http://ip-api.com/json/", timeout=5).json()
         return loc["lat"], loc["lon"], loc["city"]
@@ -112,24 +136,24 @@ def lookup_location(text):
             return float(parts[0]), float(parts[1]), ""
         except ValueError:
             pass
-    # Place name: search for the first part, prefer a match on the rest (state/country).
-    res = requests.get(
-        "https://geocoding-api.open-meteo.com/v1/search",
-        params={"name": parts[0], "count": 10, "language": "en", "format": "json"},
-        timeout=5,
-    ).json()
-    results = res.get("results") or []
-    if not results:
-        raise ValueError(f"Location not found: {text}")
-    hints = [h for h in parts[1:] if h]
-    hints = [US_STATES.get(h.upper(), h).replace("_", " ").lower() for h in hints]
-    best = results[0]
-    for r in results:
-        fields = [str(r.get(k, "")).lower() for k in ("admin1", "country", "country_code")]
-        if hints and all(h in fields for h in hints):
-            best = r
-            break
-    return best["latitude"], best["longitude"], best["name"]
+    fallback = None
+    for name, hints in _search_candidates(text):
+        if len(name) < 2:
+            continue
+        res = requests.get(
+            "https://geocoding-api.open-meteo.com/v1/search",
+            params={"name": name, "count": 20, "language": "en", "format": "json"},
+            timeout=5,
+        ).json()
+        results = res.get("results") or []
+        match = next((r for r in results if _matches(r, hints)), None)
+        if match:
+            return match["latitude"], match["longitude"], match["name"]
+        if results and fallback is None:
+            fallback = results[0]
+    if fallback is not None:
+        return fallback["latitude"], fallback["longitude"], fallback["name"]
+    raise LocationNotFound(text)
 
 
 def fetch_weather(location, units):
@@ -209,7 +233,8 @@ class SettingsDialog(QDialog):
         self.location = QLineEdit(config.get("location"))
         self.location.setPlaceholderText("Blank = detect automatically")
         self.location.setToolTip("Leave blank to guess from your internet connection,\n"
-                                 "or enter a place like 'Albany, NY' or coordinates like '42.65, -73.75'.")
+                                 "or enter a place like 'Albany, NY', a ZIP/postal code,\n"
+                                 "or coordinates like '42.65, -73.75'.")
         form.addRow("Weather location:", self.location)
 
         self.units = QComboBox()
@@ -396,8 +421,14 @@ class MissionControlBanner(QWidget):
         def work():
             try:
                 text = fetch_weather(location, units)
-            except Exception as e:  # network down, bad location, API change...
+            except LocationNotFound:
+                text = ("<span style='color:#888;'>Location not found - "
+                        "right-click &gt; Settings</span>")
+            except requests.RequestException as e:
                 print(f"Weather error: {e}", file=sys.stderr)
+                text = "<span style='color:#888;'>WX Unavailable (no connection)</span>"
+            except Exception as e:  # unexpected reply from the weather service
+                print(f"Weather error: {e!r}", file=sys.stderr)
                 text = "<span style='color:#888;'>WX Unavailable</span>"
             self.weather_ready.emit(text)
 

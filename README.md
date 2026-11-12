@@ -68,7 +68,7 @@ All settings can be changed from **Right-click → Settings…**:
 
 - **Callsign:** your amateur radio callsign.
 - **Local timezone:** start typing to search, e.g. `New_York` or `London`.
-- **Weather location:** leave blank to detect it automatically. You can also enter a place like `Albany, NY` or `London, United Kingdom`, or coordinates like `42.65, -73.75`.
+- **Weather location:** leave blank to detect it automatically. You can also enter a town and state such as `Warrensburg NY` or `Albany, NY`, a ZIP code such as `12885`, a place such as `London, United Kingdom`, or coordinates such as `42.65, -73.75`. Include the state, since many towns share a name.
 - **Temperature:** °F or °C.
 - **Weather refresh:** how often to update, in minutes.
 
