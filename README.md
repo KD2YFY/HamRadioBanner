@@ -71,17 +71,21 @@ All settings can be changed from **Right-click → Settings…**:
 - **Weather location:** leave blank to detect it automatically. You can also enter a town and state such as `Warrensburg NY` or `Albany, NY`, a ZIP code such as `12885`, a place such as `London, United Kingdom`, or coordinates such as `42.65, -73.75`. Include the state, since many towns share a name.
 - **Temperature:** °F or °C.
 - **Weather refresh:** how often to update, in minutes.
+- **Show on:** *One screen*, or *Every screen* for a separate banner on each monitor. Drag each banner where you want it on its monitor; every position is remembered, and banners appear or disappear as you plug in or unplug monitors.
+- **Install updates automatically:** install new versions without asking. See [Updating](#updating).
 
 Settings are saved to `config.ini` next to the program. You can also edit that file in a text editor; changes (such as a different operator's callsign) show up within a second, no restart needed. If you installed with pipx or use the Mac app, `config.ini` is kept in your user settings folder instead. See `config.example.ini` for the format.
 
 ## Updating
 
-The banner checks for a new version once a day. When one is out, **⬆ Update available** appears on the banner. To update:
+The banner checks for a new version once a day. When one is out, **⬆ Update available** appears on the banner.
 
-1. **Right-click → Download update…** This opens the Releases page.
-2. Download the new zip and unzip it over your old folder.
+- **One click:** right-click → **Install update now**. The banner downloads the new version, swaps it in and restarts itself in a few seconds. Your settings are kept.
+- **Fully automatic:** turn on **Settings → Install updates automatically**, and new versions install by themselves with no click needed.
 
-Your settings in `config.ini` are kept. If you use the launcher (Option B), download the new code the same way. If you installed with pipx, run `pipx upgrade hamradiobanner`.
+If the banner can't update itself, the menu shows **Download update…** instead and opens the Releases page. Download the new zip and unzip it over your old folder. This happens when the program is in a protected folder, or on a Mac when the app is still in Downloads (move it to Applications). If you installed with pipx, run `pipx upgrade hamradiobanner`.
+
+> Versions before 1.2.0 can't install updates themselves. Download 1.2.0 by hand once, and later versions will update themselves.
 
 ## Credits
 

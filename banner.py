@@ -1,24 +1,32 @@
 """Ham Radio Banner - a small always-on-top HUD showing callsign, UTC/local time and weather.
 
-Right-click the banner (or its tray icon) for Settings, Refresh Weather and Quit.
+Right-click the banner (or its tray icon) for Settings, Refresh Weather, updates and Quit.
 """
 import configparser
 import os
+import shutil
+import subprocess
 import sys
+import tempfile
 import threading
+import zipfile
 
 import requests
-from PyQt6.QtCore import QDateTime, QUrl, QFileSystemWatcher, QPoint, QStandardPaths, Qt, QTimer, QTimeZone, pyqtSignal
-from PyQt6.QtGui import QAction, QColor, QDesktopServices, QFont, QIcon, QPainter, QPixmap
+from PyQt6.QtCore import (
+    QDateTime, QFileSystemWatcher, QObject, QPoint, QProcess, QStandardPaths, Qt, QTimer, QTimeZone,
+    QUrl, pyqtSignal,
+)
+from PyQt6.QtGui import QColor, QDesktopServices, QFont, QIcon, QPainter, QPixmap
 from PyQt6.QtWidgets import (
-    QApplication, QComboBox, QCompleter, QDialog, QDialogButtonBox, QFormLayout, QHBoxLayout,
+    QApplication, QCheckBox, QComboBox, QCompleter, QDialog, QDialogButtonBox, QFormLayout, QHBoxLayout,
     QLabel, QLineEdit, QMenu, QMessageBox, QSizeGrip, QSpinBox, QSystemTrayIcon, QVBoxLayout,
     QWidget,
 )
 
-__version__ = "1.1.2"  # must match the version typed when publishing a release
+__version__ = "1.2.0"  # must match the version typed when publishing a release
 APP_NAME = "HamRadioBanner"
-RELEASES_API = "https://api.github.com/repos/KD2YFY/HamRadioBanner/releases/latest"
+RELEASES_API = os.environ.get("HAMRADIOBANNER_RELEASES_API",  # override is for testing only
+                              "https://api.github.com/repos/KD2YFY/HamRadioBanner/releases/latest")
 RELEASES_PAGE = "https://github.com/KD2YFY/HamRadioBanner/releases/latest"
 DEFAULTS = {
     "callsign": "N0CALL",
@@ -26,6 +34,8 @@ DEFAULTS = {
     "weather_refresh": "30",  # minutes
     "units": "F",             # F or C
     "location": "",           # blank = detect from IP; or "City, State" or "lat, lon"
+    "screens": "one",         # one = a single banner; all = a banner on every monitor
+    "auto_update": "no",      # yes = install new versions without asking
 }
 
 
@@ -177,6 +187,8 @@ def fetch_weather(location, units):
             f"<span style='color:#5fafff;'>L:{round(lo)}°</span>")
 
 
+
+
 # ---------------------------------------------------------------- update ---
 
 def _version_tuple(v):
@@ -187,14 +199,151 @@ def _version_tuple(v):
         return ()
 
 
+def _platform_zip():
+    if sys.platform.startswith("win"):
+        return "HamRadioBanner-Windows.zip"
+    if sys.platform == "darwin":
+        return "HamRadioBanner-macOS.zip"
+    return "HamRadioBanner-Linux.zip"
+
+
+def _mac_app_bundle():
+    """Path of HamRadioBanner.app when running as a bundled Mac app."""
+    return os.path.abspath(os.path.join(os.path.dirname(sys.executable), "..", ".."))
+
+
+def self_update_mode():
+    """How this copy can update itself: 'app' (downloaded app), 'source' (downloaded
+    code run by the launcher), or None (git checkout / pipx install / read-only folder)."""
+    folder = app_dir()
+    if getattr(sys, "frozen", False):
+        target = os.path.dirname(_mac_app_bundle()) if sys.platform == "darwin" else folder
+        return "app" if os.access(target, os.W_OK) else None
+    if ("site-packages" in folder or os.path.exists(os.path.join(folder, ".git"))
+            or not os.access(folder, os.W_OK)):
+        return None
+    return "source"
+
+
 def check_for_update():
-    """Return (version, url) of a newer GitHub release, or None."""
+    """Return {'version', 'page', 'download'} for a newer GitHub release, or None.
+    'download' is empty when this copy can't install it by itself."""
     res = requests.get(RELEASES_API, timeout=10,
                        headers={"Accept": "application/vnd.github+json"}).json()
     latest = res.get("tag_name", "")
-    if _version_tuple(latest) > _version_tuple(__version__):
-        return latest, res.get("html_url") or RELEASES_PAGE
-    return None
+    if _version_tuple(latest) <= _version_tuple(__version__):
+        return None
+    download = ""
+    mode = self_update_mode()
+    if mode == "app":
+        download = next((a.get("browser_download_url", "") for a in res.get("assets", [])
+                         if a.get("name") == _platform_zip()), "")
+    elif mode == "source":
+        download = res.get("zipball_url", "")
+    return {"version": latest, "page": res.get("html_url") or RELEASES_PAGE, "download": download}
+
+
+def _extract(zip_path, dest):
+    """Unzip, keeping the 'executable' permission on macOS/Linux."""
+    if sys.platform == "darwin":  # ditto keeps the symlinks inside a .app bundle
+        subprocess.run(["ditto", "-x", "-k", zip_path, dest], check=True)
+        return
+    with zipfile.ZipFile(zip_path) as z:
+        for info in z.infolist():
+            path = z.extract(info, dest)
+            mode = info.external_attr >> 16
+            if mode and os.name == "posix":
+                os.chmod(path, mode & 0o7777)
+
+
+def _clean_env():
+    """Environment for helper programs. A bundled Linux app points LD_LIBRARY_PATH at its
+    private libraries, which can crash system tools like cp - put the original back."""
+    env = dict(os.environ)
+    for key in ("LD_LIBRARY_PATH", "DYLD_LIBRARY_PATH"):
+        orig = env.pop(key + "_ORIG", None)
+        if orig is not None:
+            env[key] = orig
+        elif getattr(sys, "frozen", False):
+            env.pop(key, None)
+    return env
+
+
+def prepare_update(download_url):
+    """Download and unpack an update. Returns a function that finishes the install
+    once the banner has quit (or raises if anything looks wrong - nothing is changed
+    until then)."""
+    work = tempfile.mkdtemp(prefix="hamradiobanner-update-")
+    zip_path = os.path.join(work, "update.zip")
+    with requests.get(download_url, timeout=60, stream=True) as r:
+        r.raise_for_status()
+        with open(zip_path, "wb") as f:
+            for chunk in r.iter_content(256 * 1024):
+                f.write(chunk)
+    unpacked = os.path.join(work, "new")
+    _extract(zip_path, unpacked)
+    mode = self_update_mode()
+
+    if mode == "source":
+        tops = [d for d in os.listdir(unpacked) if os.path.isdir(os.path.join(unpacked, d))]
+        src = os.path.join(unpacked, tops[0]) if len(tops) == 1 else unpacked
+        if not os.path.exists(os.path.join(src, "banner.py")):
+            raise RuntimeError("download did not contain banner.py")
+
+        def finish():
+            # Plain files can be replaced while running; then start the new copy.
+            for root, dirs, files in os.walk(src):
+                dirs[:] = [d for d in dirs if d not in (".git", ".github")]
+                rel = os.path.relpath(root, src)
+                os.makedirs(os.path.join(app_dir(), rel), exist_ok=True)
+                for name in files:
+                    if name != "config.ini":
+                        shutil.copy2(os.path.join(root, name), os.path.join(app_dir(), rel, name))
+            QProcess.startDetached(sys.executable, [os.path.join(app_dir(), "banner.py")], app_dir())
+            shutil.rmtree(work, ignore_errors=True)
+        return finish
+
+    exe_name = os.path.basename(sys.executable)
+    if sys.platform == "darwin":
+        new_app = os.path.join(unpacked, "HamRadioBanner.app")
+        if not os.path.exists(os.path.join(new_app, "Contents", "MacOS", exe_name)):
+            raise RuntimeError("download did not contain the app")
+        script = os.path.join(work, "update.sh")
+        with open(script, "w") as f:
+            f.write(f"""#!/bin/sh
+while kill -0 {os.getpid()} 2>/dev/null; do sleep 0.5; done
+rm -rf "{_mac_app_bundle()}" && mv "{new_app}" "{_mac_app_bundle()}"
+open "{_mac_app_bundle()}"
+rm -rf "{work}"
+""")
+        return lambda: subprocess.Popen(["/bin/sh", script], start_new_session=True, env=_clean_env())
+
+    src = os.path.join(unpacked, "HamRadioBanner")
+    if not os.path.exists(os.path.join(src, exe_name)):
+        raise RuntimeError("download did not contain the program")
+    if sys.platform.startswith("win"):
+        script = os.path.join(work, "update.bat")
+        with open(script, "w") as f:
+            # robocopy retries files that are still locked while the old banner exits.
+            f.write(f"""@echo off
+ping -n 3 127.0.0.1 >nul
+robocopy "{src}" "{app_dir()}" /E /R:30 /W:1 /NFL /NDL /NJH /NJS /NP >nul
+start "" "{sys.executable}"
+(goto) 2>nul & rd /s /q "{work}"
+""")
+        flags = subprocess.CREATE_NO_WINDOW | subprocess.CREATE_NEW_PROCESS_GROUP
+        return lambda: subprocess.Popen(["cmd.exe", "/c", script], creationflags=flags, close_fds=True,
+                                        env=_clean_env())
+
+    script = os.path.join(work, "update.sh")
+    with open(script, "w") as f:
+        f.write(f"""#!/bin/sh
+while kill -0 {os.getpid()} 2>/dev/null; do sleep 0.5; done
+cp -Rf "{src}/." "{app_dir()}/"
+nohup "{sys.executable}" >/dev/null 2>&1 &
+rm -rf "{work}"
+""")
+    return lambda: subprocess.Popen(["/bin/sh", script], start_new_session=True, env=_clean_env())
 
 
 # -------------------------------------------------------------- settings ---
@@ -248,6 +397,20 @@ class SettingsDialog(QDialog):
         self.refresh.setValue(_int(config.get("weather_refresh"), 30))
         form.addRow("Weather refresh:", self.refresh)
 
+        self.screens = QComboBox()
+        self.screens.addItems(["One screen", "Every screen"])
+        self.screens.setCurrentIndex(1 if config.get("screens").lower() == "all" else 0)
+        self.screens.setToolTip("Every screen = a separate banner on each monitor.\n"
+                                "Drag each one where you want it; positions are remembered.")
+        form.addRow("Show on:", self.screens)
+
+        self.auto_update = QCheckBox("Install updates automatically")
+        self.auto_update.setChecked(config.get("auto_update").lower() in ("yes", "true", "1", "on"))
+        if self_update_mode() is None:
+            self.auto_update.setEnabled(False)
+            self.auto_update.setToolTip("This copy can't update itself (installed with pipx or git).")
+        form.addRow("Updates:", self.auto_update)
+
         buttons = QDialogButtonBox(QDialogButtonBox.StandardButton.Save | QDialogButtonBox.StandardButton.Cancel)
         buttons.accepted.connect(self.accept)
         buttons.rejected.connect(self.reject)
@@ -259,11 +422,14 @@ class SettingsDialog(QDialog):
             QMessageBox.warning(self, "Unknown timezone",
                                 f"'{tz}' is not a known timezone.\nPick one from the list, e.g. America/New_York.")
             return
+        self.config.reload()  # keep window positions saved since the dialog opened
         self.config.set("callsign", self.callsign.text().strip().upper() or DEFAULTS["callsign"])
         self.config.set("timezone", tz)
         self.config.set("location", self.location.text().strip())
         self.config.set("units", "C" if self.units.currentIndex() == 1 else "F")
         self.config.set("weather_refresh", self.refresh.value())
+        self.config.set("screens", "all" if self.screens.currentIndex() == 1 else "one")
+        self.config.set("auto_update", "yes" if self.auto_update.isChecked() else "no")
         try:
             self.config.save()
         except OSError as e:
@@ -278,17 +444,249 @@ def _int(value, default):
         return default
 
 
-# ---------------------------------------------------------------- banner ---
+# ------------------------------------------------------------ controller ---
 
-class MissionControlBanner(QWidget):
-    weather_ready = pyqtSignal(str)
-    update_found = pyqtSignal(str, str)
+class Controller(QObject):
+    """Holds the settings, clock, weather and update state shared by every banner."""
+    changed = pyqtSignal()
+    _weather_ready = pyqtSignal(str)
+    _update_found = pyqtSignal(dict)
+    _update_ready = pyqtSignal(object)
+    _update_failed = pyqtSignal(str)
 
-    def __init__(self, config):
+    def __init__(self, config, icon):
         super().__init__()
         self.config = config
+        self.icon = icon
+        self.banners = {}
         self.weather_info = "Loading WX..."
+        self.update_info = None
+        self.status_text = ""
         self._fetching = False
+        self._updating = False
+
+        # Shared menu used by every banner and the tray icon.
+        self.menu = QMenu()
+        self.menu.addAction("Settings…", lambda: self.open_settings())
+        self.menu.addAction("Refresh Weather", self.get_weather)
+        self.update_action = self.menu.addAction("Update", self.on_update_clicked)
+        self.update_action.setVisible(False)
+        self.menu.addSeparator()
+        self.menu.addAction(f"Version {__version__}").setEnabled(False)
+        self.menu.addAction("Quit", QApplication.instance().quit)
+
+        self._weather_ready.connect(self._on_weather)
+        self._update_found.connect(self._on_update_found)
+        self._update_ready.connect(self._on_update_ready)
+        self._update_failed.connect(self._on_update_failed)
+
+        self.clock_timer = QTimer(self)
+        self.clock_timer.timeout.connect(self.changed)
+        self.clock_timer.start(1000)
+        self.weather_timer = QTimer(self)
+        self.weather_timer.timeout.connect(self.get_weather)
+        # Check GitHub for a newer release shortly after start, then once a day.
+        self.update_timer = QTimer(self)
+        self.update_timer.timeout.connect(self.check_update)
+        self.update_timer.start(24 * 60 * 60 * 1000)
+        QTimer.singleShot(5000, self.check_update)
+
+        # Apply hand edits to config.ini right away (e.g. another operator's callsign).
+        self.watcher = QFileSystemWatcher(self)
+        self.watcher.fileChanged.connect(lambda _p: QTimer.singleShot(200, self._reload_config))
+
+        app = QApplication.instance()
+        app.screenAdded.connect(lambda _s: QTimer.singleShot(1000, self.layout_banners))
+        app.screenRemoved.connect(lambda _s: QTimer.singleShot(1000, self.layout_banners))
+        app.aboutToQuit.connect(self.save_all_geometry)
+
+        self.tray = None
+        if QSystemTrayIcon.isSystemTrayAvailable():
+            self.tray = QSystemTrayIcon(icon)
+            self.tray.setToolTip("Ham Radio Banner")
+            self.tray.setContextMenu(self.menu)
+            self.tray.activated.connect(self.show_banners)
+            self.tray.show()
+
+        self.apply_settings()
+
+    # --- settings ---
+    def _watch_config(self):
+        if os.path.exists(self.config.path) and self.config.path not in self.watcher.files():
+            self.watcher.addPath(self.config.path)
+
+    def _reload_config(self):
+        # Some editors replace the file on save, so watch it again.
+        self._watch_config()
+        if self.config.reload() and self.config.settings() != self._applied:
+            self.apply_settings()
+
+    def apply_settings(self):
+        old = getattr(self, "_applied", {})
+        self._applied = self.config.settings()
+        self._watch_config()
+        self.callsign = self.config.get("callsign")
+        tz_name = self.config.get("timezone")
+        self.tz = QTimeZone(tz_name.encode()) if tz_name else QTimeZone.systemTimeZone()
+        self.tz_bad = not self.tz.isValid()
+        if self.tz_bad:
+            self.tz = QTimeZone.systemTimeZone()
+        self.tz_label = self.tz.id().data().decode().split("/")[-1].replace("_", " ")
+        self.weather_timer.start(max(5, _int(self.config.get("weather_refresh"), 30)) * 60000)
+        if any(old.get(k) != self._applied[k] for k in ("location", "units")) or not old:
+            self.get_weather()
+        if old.get("screens") != self._applied["screens"]:
+            self.layout_banners()
+        self.changed.emit()
+
+    def open_settings(self, first_run=False):
+        parent = next(iter(self.banners.values()), None)
+        if SettingsDialog(self.config, parent, first_run=first_run).exec():
+            self.apply_settings()
+
+    # --- banners: one, or one per monitor ---
+    def layout_banners(self):
+        if self.config.get("screens").lower() == "all":
+            wanted = {f"WINDOW {s.name()}": s for s in QApplication.screens()}
+        else:
+            wanted = {"WINDOW": None}
+        for key in list(self.banners):
+            if key not in wanted:
+                self.banners.pop(key).deleteLater()
+        for key, screen in wanted.items():
+            if key not in self.banners:
+                banner = Banner(self, key, screen)
+                self.banners[key] = banner
+                banner.show()
+
+    def show_banners(self, *_):
+        for b in self.banners.values():
+            b.show()
+            b.raise_()
+
+    def save_geometry(self, banner):
+        if not self.config.exists or not self.config.reload():
+            return  # never overwrite hand edits or a half-saved file
+        if not self.config.parser.has_section(banner.key):
+            self.config.parser.add_section(banner.key)
+        w = self.config.parser[banner.key]
+        w["x"], w["y"] = str(banner.x()), str(banner.y())
+        w["width"], w["height"] = str(banner.width()), str(banner.height())
+        try:
+            self.config.save()
+        except OSError:
+            pass
+
+    def save_all_geometry(self):
+        for b in self.banners.values():
+            self.save_geometry(b)
+
+    # --- weather (runs in background so the clock never freezes) ---
+    def get_weather(self):
+        if self._fetching:
+            return
+        self._fetching = True
+        location, units = self.config.get("location"), self.config.get("units").upper()
+
+        def work():
+            try:
+                text = fetch_weather(location, units)
+            except LocationNotFound:
+                text = ("<span style='color:#888;'>Location not found - "
+                        "right-click &gt; Settings</span>")
+            except requests.RequestException as e:
+                print(f"Weather error: {e}", file=sys.stderr)
+                text = "<span style='color:#888;'>WX Unavailable (no connection)</span>"
+            except Exception as e:  # unexpected reply from the weather service
+                print(f"Weather error: {e!r}", file=sys.stderr)
+                text = "<span style='color:#888;'>WX Unavailable</span>"
+            self._weather_ready.emit(text)
+
+        threading.Thread(target=work, daemon=True).start()
+
+    def _on_weather(self, text):
+        self._fetching = False
+        self.weather_info = text
+        self.changed.emit()
+
+    # --- updates ---
+    def check_update(self):
+        def work():
+            try:
+                found = check_for_update()
+            except Exception as e:  # offline, GitHub down, rate-limited... try again tomorrow
+                print(f"Update check failed: {e}", file=sys.stderr)
+                return
+            if found:
+                self._update_found.emit(found)
+
+        threading.Thread(target=work, daemon=True).start()
+
+    def _on_update_found(self, info):
+        if self._updating:
+            return
+        self.update_info = info
+        if info["download"]:
+            self.update_action.setText(f"Install update ({info['version']}) now")
+        else:
+            self.update_action.setText(f"Download update ({info['version']})…")
+        self.update_action.setVisible(True)
+        auto = self.config.get("auto_update").lower() in ("yes", "true", "1", "on")
+        if info["download"] and auto:
+            self.install_update()
+        else:
+            self.status_text = "⬆ Update available (right-click)"
+            self.changed.emit()
+
+    def on_update_clicked(self):
+        if self.update_info and self.update_info["download"]:
+            self.install_update()
+        elif self.update_info:
+            QDesktopServices.openUrl(QUrl(self.update_info["page"]))
+
+    def install_update(self):
+        if self._updating:
+            return
+        self._updating = True
+        self.update_action.setEnabled(False)
+        self.status_text = f"Updating to {self.update_info['version']}…"
+        self.changed.emit()
+        url = self.update_info["download"]
+
+        def work():
+            try:
+                self._update_ready.emit(prepare_update(url))
+            except Exception as e:
+                print(f"Update failed: {e!r}", file=sys.stderr)
+                self._update_failed.emit(str(e))
+
+        threading.Thread(target=work, daemon=True).start()
+
+    def _on_update_ready(self, finish):
+        self.save_all_geometry()
+        try:
+            finish()
+        except Exception as e:
+            self._on_update_failed(str(e))
+            return
+        QApplication.instance().quit()
+
+    def _on_update_failed(self, _msg):
+        # Fall back to the manual way: open the Releases page.
+        self._updating = False
+        self.update_info["download"] = ""
+        self.update_action.setEnabled(True)
+        self.update_action.setText(f"Download update ({self.update_info['version']})…")
+        self.status_text = "⬆ Update failed - right-click to download"
+        self.changed.emit()
+
+
+# ---------------------------------------------------------------- banner ---
+
+class Banner(QWidget):
+    def __init__(self, ctl, key, screen=None):
+        super().__init__()
+        self.ctl, self.key, self.screen_ = ctl, key, screen
         self.offset = QPoint()
 
         self.setWindowTitle("Ham Radio Banner")
@@ -323,170 +721,50 @@ class MissionControlBanner(QWidget):
             QLabel { border: none; background: transparent; color: white; }
         """)
 
-        self.menu = QMenu()
-        self.menu.addAction("Settings…", self.open_settings)
-        self.menu.addAction("Refresh Weather", self.get_weather)
-        self.update_url = RELEASES_PAGE
-        self.update_action = QAction("Download update", self)
-        self.update_action.triggered.connect(lambda: QDesktopServices.openUrl(QUrl(self.update_url)))
-        self.update_action.setVisible(False)
-        self.menu.addAction(self.update_action)
-        self.menu.addSeparator()
-        about = self.menu.addAction(f"Version {__version__}")
-        about.setEnabled(False)
-        self.menu.addAction("Quit", QApplication.instance().quit)
-        self.update_text = ""
-
-        # Check GitHub for a newer release shortly after start, then once a day.
-        self.update_found.connect(self._on_update_found)
-        self.update_timer = QTimer(self)
-        self.update_timer.timeout.connect(self.check_update)
-        self.update_timer.start(24 * 60 * 60 * 1000)
-        QTimer.singleShot(5000, self.check_update)
-
-        self.weather_ready.connect(self._on_weather)
-        self.clock_timer = QTimer(self)
-        self.clock_timer.timeout.connect(self.update_display)
-        self.clock_timer.start(1000)
-        self.weather_timer = QTimer(self)
-        self.weather_timer.timeout.connect(self.get_weather)
-
-        # Apply hand edits to config.ini right away (e.g. another operator's callsign).
-        self.watcher = QFileSystemWatcher(self)
-        self.watcher.fileChanged.connect(self._on_config_file_changed)
-        self.apply_settings()
+        ctl.changed.connect(self.update_display)
+        self.update_display()
         self.restore_geometry()
 
-    # --- settings ---
-    def _watch_config(self):
-        if os.path.exists(self.config.path) and self.config.path not in self.watcher.files():
-            self.watcher.addPath(self.config.path)
-
-    def _on_config_file_changed(self, _path):
-        # Some editors replace the file on save; wait a moment, then watch it again.
-        QTimer.singleShot(200, self._reload_config)
-
-    def _reload_config(self):
-        self._watch_config()
-        if self.config.reload() and self.config.settings() != self._applied:
-            self.apply_settings()
-
-    def apply_settings(self):
-        self._applied = self.config.settings()
-        self._watch_config()
-        self.callsign = self.config.get("callsign")
-        tz_name = self.config.get("timezone")
-        self.tz = QTimeZone(tz_name.encode()) if tz_name else QTimeZone.systemTimeZone()
-        self.tz_bad = not self.tz.isValid()
-        if self.tz_bad:
-            self.tz = QTimeZone.systemTimeZone()
-        tz_id = self.tz.id().data().decode()
-        self.tz_label = tz_id.split("/")[-1].replace("_", " ")
-        self.weather_timer.start(max(5, _int(self.config.get("weather_refresh"), 30)) * 60000)
-        self.get_weather()
-        self.update_display()
-
-    def open_settings(self, first_run=False):
-        dlg = SettingsDialog(self.config, self, first_run=first_run)
-        if dlg.exec():
-            self.apply_settings()
-
-    # --- weather (runs in background so the clock never freezes) ---
-    def check_update(self):
-        def work():
-            try:
-                found = check_for_update()
-            except Exception as e:  # offline, GitHub down, rate-limited... try again tomorrow
-                print(f"Update check failed: {e}", file=sys.stderr)
-                return
-            if found:
-                self.update_found.emit(*found)
-
-        threading.Thread(target=work, daemon=True).start()
-
-    def _on_update_found(self, version, url):
-        self.update_url = url
-        self.update_action.setText(f"Download update ({version})…")
-        self.update_action.setVisible(True)
-        self.update_text = ("<span style='color:#E6A23C; font-size:11px;'> &nbsp;⬆ Update available "
-                            "(right-click)</span>")
-        self.update_display()
-
-    def get_weather(self):
-        if self._fetching:
-            return
-        self._fetching = True
-        location, units = self.config.get("location"), self.config.get("units").upper()
-
-        def work():
-            try:
-                text = fetch_weather(location, units)
-            except LocationNotFound:
-                text = ("<span style='color:#888;'>Location not found - "
-                        "right-click &gt; Settings</span>")
-            except requests.RequestException as e:
-                print(f"Weather error: {e}", file=sys.stderr)
-                text = "<span style='color:#888;'>WX Unavailable (no connection)</span>"
-            except Exception as e:  # unexpected reply from the weather service
-                print(f"Weather error: {e!r}", file=sys.stderr)
-                text = "<span style='color:#888;'>WX Unavailable</span>"
-            self.weather_ready.emit(text)
-
-        threading.Thread(target=work, daemon=True).start()
-
-    def _on_weather(self, text):
-        self._fetching = False
-        self.weather_info = text
-        self.update_display()
-
     def update_display(self):
+        c = self.ctl
         utc_dt = QDateTime.currentDateTimeUtc()
-        local_dt = QDateTime.currentDateTime().toTimeZone(self.tz)
-        warn = ""
-        if self.tz_bad:
-            warn = "<span style='color:red; font-size:10px;'> ! BAD TIMEZONE IN SETTINGS !</span>"
+        local_dt = QDateTime.currentDateTime().toTimeZone(c.tz)
+        extra = ""
+        if c.tz_bad:
+            extra += "<span style='color:red; font-size:10px;'> ! BAD TIMEZONE IN SETTINGS !</span>"
+        if c.status_text:
+            extra += f"<span style='color:#E6A23C; font-size:11px;'> &nbsp;{c.status_text}</span>"
         self.label.setText(f"""
         <div style='white-space: nowrap; font-weight: bold;'>
-            <span style='color: #E6A23C; font-size: 18px;'>{self.callsign}</span> &nbsp;&nbsp;
+            <span style='color: #E6A23C; font-size: 18px;'>{c.callsign}</span> &nbsp;&nbsp;
             <span style='color: #409EFF; font-size: 11px;'>UTC</span>
             <span style='color: #409EFF; font-size: 24px;'> {utc_dt.toString("hh:mm:ss")} </span> &nbsp;&nbsp;
             <span style='color: #888; font-size: 14px;'>{local_dt.toString("yyyy-MM-dd")}</span> &nbsp;&nbsp;
-            <span style='color: #E6A23C; font-size: 11px;'>{self.tz_label}</span>
+            <span style='color: #E6A23C; font-size: 11px;'>{c.tz_label}</span>
             <span style='color: #E6A23C; font-size: 24px;'> {local_dt.toString("hh:mm:ss")} </span> &nbsp;&nbsp;
             <span style='color: #67C23A; font-size: 11px;'>WX</span>
-            <span style='color: white; font-size: 18px;'> {self.weather_info} </span>
-            {warn}{self.update_text}
+            <span style='color: white; font-size: 18px;'> {c.weather_info} </span>
+            {extra}
         </div>
         """)
 
     # --- remember where the window was ---
     def restore_geometry(self):
-        w = self.config.parser["WINDOW"]
-        if "x" in w:
+        parser = self.ctl.config.parser
+        target = self.screen_ or QApplication.primaryScreen()
+        if parser.has_section(self.key) and "x" in parser[self.key]:
+            w = parser[self.key]
             self.resize(_int(w.get("width"), 0) or self.sizeHint().width(),
                         _int(w.get("height"), 0) or self.sizeHint().height())
             pos = QPoint(_int(w.get("x"), 0), _int(w.get("y"), 0))
-            # Only restore the position if it is still on a connected screen.
-            if QApplication.screenAt(pos + QPoint(20, 20)) is not None:
+            # Only restore the position if it is still on a connected screen (the right one).
+            on = QApplication.screenAt(pos + QPoint(20, 20))
+            if on is not None and (self.screen_ is None or on == self.screen_):
                 self.move(pos)
                 return
-        screen = QApplication.primaryScreen().availableGeometry()
+        area = target.availableGeometry()
         self.adjustSize()
-        self.move(screen.center().x() - self.width() // 2, screen.top() + 20)
-
-    def save_geometry(self):
-        if not self.config.exists:
-            return
-        # Re-read first so we never overwrite edits someone made to config.ini by hand.
-        if not self.config.reload():
-            return
-        w = self.config.parser["WINDOW"]
-        w["x"], w["y"] = str(self.x()), str(self.y())
-        w["width"], w["height"] = str(self.width()), str(self.height())
-        try:
-            self.config.save()
-        except OSError:
-            pass
+        self.move(area.center().x() - self.width() // 2, area.top() + 20)
 
     # --- mouse ---
     def mousePressEvent(self, event):
@@ -498,13 +776,13 @@ class MissionControlBanner(QWidget):
             self.move(self.mapToGlobal(event.position().toPoint() - self.offset))
 
     def mouseReleaseEvent(self, event):
-        self.save_geometry()
+        self.ctl.save_geometry(self)
 
     def mouseDoubleClickEvent(self, event):
-        self.open_settings()
+        self.ctl.open_settings()
 
     def contextMenuEvent(self, event):
-        self.menu.exec(event.globalPos())
+        self.ctl.menu.exec(event.globalPos())
 
 
 def make_icon():
@@ -530,30 +808,9 @@ def main():
     app.setWindowIcon(icon)
 
     config = Config()
-    banner = MissionControlBanner(config)
-    banner.show()
-
-    # Tray icon: the banner has no taskbar button, so this is how to find/quit it.
-    tray = None
-    if QSystemTrayIcon.isSystemTrayAvailable():
-        tray = QSystemTrayIcon(icon)
-        tray.setToolTip("Ham Radio Banner")
-        tray_menu = QMenu()
-        show = QAction("Show Banner", tray_menu)
-        show.triggered.connect(lambda: (banner.show(), banner.raise_()))
-        tray_menu.addAction(show)
-        tray_menu.addAction("Settings…", banner.open_settings)
-        tray_menu.addAction("Refresh Weather", banner.get_weather)
-        tray_menu.addAction(banner.update_action)
-        tray_menu.addSeparator()
-        tray_menu.addAction("Quit", app.quit)
-        tray.setContextMenu(tray_menu)
-        tray.show()
-
+    ctl = Controller(config, icon)
     if not config.exists:
-        QTimer.singleShot(300, lambda: banner.open_settings(first_run=True))
-
-    app.aboutToQuit.connect(banner.save_geometry)
+        QTimer.singleShot(300, lambda: ctl.open_settings(first_run=True))
     sys.exit(app.exec())
 
 
