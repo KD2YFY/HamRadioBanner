@@ -24,7 +24,7 @@ from PyQt6.QtWidgets import (
     QWidget,
 )
 
-__version__ = "1.2.1"  # must match the version typed when publishing a release
+__version__ = "1.2.2"  # must match the version typed when publishing a release
 APP_NAME = "HamRadioBanner"
 RELEASES_API = os.environ.get("HAMRADIOBANNER_RELEASES_API",  # override is for testing only
                               "https://api.github.com/repos/KD2YFY/HamRadioBanner/releases/latest")
@@ -428,11 +428,76 @@ def refresh_autostart():
 
 # -------------------------------------------------------------- settings ---
 
+def _ui_images():
+    """Draw the check mark and drop-down arrow used by the Settings window once, as PNG
+    files (style sheets need image files; this way none have to ship with the program)."""
+    folder = os.path.join(tempfile.gettempdir(), f"hamradiobanner-ui-{__version__}")
+    check, arrow = os.path.join(folder, "check.png"), os.path.join(folder, "arrow.png")
+    if not (os.path.exists(check) and os.path.exists(arrow)):
+        os.makedirs(folder, exist_ok=True)
+        for path, points in ((check, [(4, 10), (8, 14), (16, 5)]), (arrow, [(5, 8), (10, 13), (15, 8)])):
+            pix = QPixmap(20, 20)
+            pix.fill(Qt.GlobalColor.transparent)
+            p = QPainter(pix)
+            p.setRenderHint(QPainter.RenderHint.Antialiasing)
+            pen = p.pen()
+            pen.setColor(QColor("#101015" if path == check else "#e6e6e6"))
+            pen.setWidthF(2.6)
+            pen.setCapStyle(Qt.PenCapStyle.RoundCap)
+            pen.setJoinStyle(Qt.PenJoinStyle.RoundJoin)
+            p.setPen(pen)
+            for (x1, y1), (x2, y2) in zip(points, points[1:]):
+                p.drawLine(x1, y1, x2, y2)
+            p.end()
+            pix.save(path)
+    return check.replace("\\", "/"), arrow.replace("\\", "/")
+
+
+def settings_style():
+    check, arrow = _ui_images()
+    return f"""
+        QDialog {{ background: #1b1b22; }}
+        QLabel, QCheckBox {{ color: #e6e6e6; font-size: 13px; }}
+        QLineEdit, QComboBox, QSpinBox {{
+            background: #2a2a35; color: #ffffff; font-size: 13px;
+            border: 1px solid #4a4a5a; border-radius: 5px; padding: 5px 8px; min-height: 18px;
+        }}
+        QLineEdit:focus, QComboBox:focus, QSpinBox:focus {{ border-color: #409EFF; }}
+        QComboBox::drop-down {{ border: none; width: 24px; }}
+        QComboBox::down-arrow {{ image: url("{arrow}"); width: 14px; height: 14px; }}
+        QComboBox QAbstractItemView {{
+            background: #2a2a35; color: #ffffff; selection-background-color: #409EFF;
+            border: 1px solid #4a4a5a;
+        }}
+        QSpinBox::up-button, QSpinBox::down-button {{ width: 0; border: none; }}
+        QCheckBox {{ spacing: 10px; padding: 3px 0; }}
+        QCheckBox::indicator {{
+            width: 18px; height: 18px; border: 2px solid #8a8aa0; border-radius: 4px;
+            background: #2a2a35;
+        }}
+        QCheckBox::indicator:hover {{ border-color: #E6A23C; }}
+        QCheckBox::indicator:checked {{
+            background: #E6A23C; border-color: #E6A23C; image: url("{check}");
+        }}
+        QCheckBox::indicator:disabled {{ border-color: #4a4a5a; background: #22222a; }}
+        QCheckBox:disabled {{ color: #777; }}
+        QPushButton {{
+            background: #2a2a35; color: #ffffff; font-size: 13px;
+            border: 1px solid #4a4a5a; border-radius: 5px; padding: 6px 18px;
+        }}
+        QPushButton:hover {{ border-color: #409EFF; }}
+        QPushButton:default {{ background: #409EFF; border-color: #409EFF; }}
+        QToolTip {{ background: #2a2a35; color: #ffffff; border: 1px solid #4a4a5a; }}
+    """
+
+
 class SettingsDialog(QDialog):
     def __init__(self, config, parent=None, first_run=False):
         super().__init__(parent)
         self.setWindowTitle("Ham Radio Banner - Settings")
         self.setWindowFlag(Qt.WindowType.WindowStaysOnTopHint)
+        self.setStyleSheet(settings_style())
+        self.setMinimumWidth(440)
         self.config = config
         layout = QVBoxLayout(self)
 
@@ -559,6 +624,11 @@ class Controller(QObject):
         self.menu = QMenu()
         self.menu.addAction("Settings…", lambda: self.open_settings())
         self.menu.addAction("Refresh Weather", self.get_weather)
+        self.menu_banner = None  # the banner that was right-clicked
+        self.match_size_action = self.menu.addAction("Make all banners this size", self.match_size)
+        self.menu.aboutToShow.connect(
+            lambda: self.match_size_action.setVisible(len(self.banners) > 1 and self.menu_banner is not None))
+        self.menu.aboutToHide.connect(lambda: QTimer.singleShot(0, self._forget_menu_banner))
         self.update_action = self.menu.addAction("Update", self.on_update_clicked)
         self.update_action.setVisible(False)
         self.menu.addSeparator()
@@ -630,8 +700,8 @@ class Controller(QObject):
         self.changed.emit()
 
     def open_settings(self, first_run=False):
-        parent = next(iter(self.banners.values()), None)
-        if SettingsDialog(self.config, parent, first_run=first_run).exec():
+        # No parent window: otherwise the banner's dark style leaks into the dialog.
+        if SettingsDialog(self.config, None, first_run=first_run).exec():
             self.apply_settings()
 
     # --- banners: one, or one per monitor ---
@@ -648,6 +718,18 @@ class Controller(QObject):
                 banner = Banner(self, key, screen)
                 self.banners[key] = banner
                 banner.show()
+
+    def _forget_menu_banner(self):
+        self.menu_banner = None
+
+    def match_size(self):
+        source = self.menu_banner
+        if source is None:
+            return
+        for b in self.banners.values():
+            if b is not source:
+                b.resize(source.size())
+                self.save_geometry(b)
 
     def show_banners(self, *_):
         for b in self.banners.values():
@@ -874,6 +956,7 @@ class Banner(QWidget):
         self.ctl.open_settings()
 
     def contextMenuEvent(self, event):
+        self.ctl.menu_banner = self
         self.ctl.menu.exec(event.globalPos())
 
 

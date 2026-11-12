@@ -56,6 +56,7 @@ On first run, a small window asks for your **callsign**. Your timezone is detect
 |---------------------------|----------------------------------------------------------|
 | Move it                   | Click and drag anywhere on the banner                    |
 | Resize it                 | Drag the bottom-right corner                             |
+| Match sizes (multi-screen)| Resize one banner, then **Right-click → Make all banners this size** |
 | Change settings           | **Right-click → Settings…** (or double-click the banner) |
 | Update the weather now    | **Right-click → Refresh Weather**                        |
 | Quit                      | **Right-click → Quit**, or use the tray icon             |
