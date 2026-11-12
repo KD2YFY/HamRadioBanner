@@ -48,7 +48,7 @@ hamradiobanner
 
 ## First run
 
-On first run, a small window asks for your **callsign**. Your timezone is detected automatically, and so is your weather location. Click **Save** and you're done.
+On first run, a small window asks for your **callsign**. Your timezone is detected automatically, and so is your weather location. Click **Save** and you're done. From then on, the banner starts by itself whenever you turn on the computer.
 
 ## Using it
 
@@ -59,6 +59,7 @@ On first run, a small window asks for your **callsign**. Your timezone is detect
 | Change settings           | **Right-click → Settings…** (or double-click the banner) |
 | Update the weather now    | **Right-click → Refresh Weather**                        |
 | Quit                      | **Right-click → Quit**, or use the tray icon             |
+| Find a hidden banner      | Start it again; the running banner comes to the front     |
 
 The banner remembers its position and size between runs. A tray icon (**HR**) also appears in your system tray or menu bar, so you can find the banner or quit it.
 
@@ -73,6 +74,7 @@ All settings can be changed from **Right-click → Settings…**:
 - **Weather refresh:** how often to update, in minutes.
 - **Show on:** *One screen*, or *Every screen* for a separate banner on each monitor. Drag each banner where you want it on its monitor; every position is remembered, and banners appear or disappear as you plug in or unplug monitors.
 - **Install updates automatically:** install new versions without asking. See [Updating](#updating).
+- **Start when the computer starts:** the banner opens by itself when you log in. This is on by default for new installs. Untick it to stop.
 
 Settings are saved to `config.ini` next to the program. You can also edit that file in a text editor; changes (such as a different operator's callsign) show up within a second, no restart needed. If you installed with pipx or use the Mac app, `config.ini` is kept in your user settings folder instead. See `config.example.ini` for the format.
 

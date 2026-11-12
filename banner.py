@@ -16,6 +16,7 @@ from PyQt6.QtCore import (
     QDateTime, QFileSystemWatcher, QObject, QPoint, QProcess, QStandardPaths, Qt, QTimer, QTimeZone,
     QUrl, pyqtSignal,
 )
+from PyQt6.QtNetwork import QLocalServer, QLocalSocket
 from PyQt6.QtGui import QColor, QDesktopServices, QFont, QIcon, QPainter, QPixmap
 from PyQt6.QtWidgets import (
     QApplication, QCheckBox, QComboBox, QCompleter, QDialog, QDialogButtonBox, QFormLayout, QHBoxLayout,
@@ -23,7 +24,7 @@ from PyQt6.QtWidgets import (
     QWidget,
 )
 
-__version__ = "1.2.0"  # must match the version typed when publishing a release
+__version__ = "1.2.1"  # must match the version typed when publishing a release
 APP_NAME = "HamRadioBanner"
 RELEASES_API = os.environ.get("HAMRADIOBANNER_RELEASES_API",  # override is for testing only
                               "https://api.github.com/repos/KD2YFY/HamRadioBanner/releases/latest")
@@ -346,6 +347,85 @@ rm -rf "{work}"
     return lambda: subprocess.Popen(["/bin/sh", script], start_new_session=True, env=_clean_env())
 
 
+# ------------------------------------------------------- start with computer ---
+
+AUTOSTART_NAME = "HamRadioBanner"
+_MAC_PLIST = os.path.expanduser("~/Library/LaunchAgents/com.kd2yfy.hamradiobanner.plist")
+_LINUX_DESKTOP = os.path.join(os.environ.get("XDG_CONFIG_HOME") or os.path.expanduser("~/.config"),
+                              "autostart", "hamradiobanner.desktop")
+
+
+def launch_command():
+    """The command that starts this copy of the banner."""
+    if getattr(sys, "frozen", False):
+        if sys.platform == "darwin":
+            return ["/usr/bin/open", _mac_app_bundle()]
+        return [sys.executable]
+    python = sys.executable
+    if sys.platform.startswith("win"):  # pythonw = no console window
+        pythonw = os.path.join(os.path.dirname(python), "pythonw.exe")
+        python = pythonw if os.path.exists(pythonw) else python
+    return [python, os.path.abspath(__file__)]
+
+
+def autostart_enabled():
+    try:
+        if sys.platform.startswith("win"):
+            import winreg
+            with winreg.OpenKey(winreg.HKEY_CURRENT_USER,
+                                r"Software\Microsoft\Windows\CurrentVersion\Run") as key:
+                winreg.QueryValueEx(key, AUTOSTART_NAME)
+            return True
+        if sys.platform == "darwin":
+            return os.path.exists(_MAC_PLIST)
+        return os.path.exists(_LINUX_DESKTOP)
+    except OSError:
+        return False
+
+
+def set_autostart(enabled):
+    """Add or remove the banner from the programs that start when you log in."""
+    cmd = launch_command()
+    if sys.platform.startswith("win"):
+        import winreg
+        with winreg.OpenKey(winreg.HKEY_CURRENT_USER, r"Software\Microsoft\Windows\CurrentVersion\Run",
+                            0, winreg.KEY_SET_VALUE) as key:
+            if enabled:
+                winreg.SetValueEx(key, AUTOSTART_NAME, 0, winreg.REG_SZ, subprocess.list2cmdline(cmd))
+            else:
+                try:
+                    winreg.DeleteValue(key, AUTOSTART_NAME)
+                except FileNotFoundError:
+                    pass
+        return
+    path = _MAC_PLIST if sys.platform == "darwin" else _LINUX_DESKTOP
+    if not enabled:
+        if os.path.exists(path):
+            os.remove(path)
+        return
+    os.makedirs(os.path.dirname(path), exist_ok=True)
+    if sys.platform == "darwin":
+        import plistlib
+        with open(path, "wb") as f:
+            plistlib.dump({"Label": "com.kd2yfy.hamradiobanner", "ProgramArguments": cmd,
+                           "RunAtLoad": True}, f)
+    else:
+        import shlex
+        with open(path, "w", encoding="utf-8") as f:
+            f.write("[Desktop Entry]\nType=Application\nName=Ham Radio Banner\n"
+                    f"Exec={' '.join(shlex.quote(c) for c in cmd)}\n"
+                    "X-GNOME-Autostart-enabled=true\n")
+
+
+def refresh_autostart():
+    """If start-at-login is on, point it at this copy (in case the folder was moved)."""
+    try:
+        if autostart_enabled():
+            set_autostart(True)
+    except OSError:
+        pass
+
+
 # -------------------------------------------------------------- settings ---
 
 class SettingsDialog(QDialog):
@@ -411,6 +491,10 @@ class SettingsDialog(QDialog):
             self.auto_update.setToolTip("This copy can't update itself (installed with pipx or git).")
         form.addRow("Updates:", self.auto_update)
 
+        self.autostart = QCheckBox("Start when the computer starts")
+        self.autostart.setChecked(True if first_run else autostart_enabled())
+        form.addRow("Startup:", self.autostart)
+
         buttons = QDialogButtonBox(QDialogButtonBox.StandardButton.Save | QDialogButtonBox.StandardButton.Cancel)
         buttons.accepted.connect(self.accept)
         buttons.rejected.connect(self.reject)
@@ -430,6 +514,11 @@ class SettingsDialog(QDialog):
         self.config.set("weather_refresh", self.refresh.value())
         self.config.set("screens", "all" if self.screens.currentIndex() == 1 else "one")
         self.config.set("auto_update", "yes" if self.auto_update.isChecked() else "no")
+        if self.autostart.isChecked() != autostart_enabled():
+            try:
+                set_autostart(self.autostart.isChecked())
+            except OSError as e:
+                QMessageBox.warning(self, "Startup setting", f"Could not change the startup setting:\n{e}")
         try:
             self.config.save()
         except OSError as e:
@@ -464,6 +553,7 @@ class Controller(QObject):
         self.status_text = ""
         self._fetching = False
         self._updating = False
+        self.instance_server = None
 
         # Shared menu used by every banner and the tray icon.
         self.menu = QMenu()
@@ -664,6 +754,8 @@ class Controller(QObject):
 
     def _on_update_ready(self, finish):
         self.save_all_geometry()
+        if self.instance_server is not None:
+            self.instance_server.close()  # let the new version start up as the only copy
         try:
             finish()
         except Exception as e:
@@ -807,8 +899,25 @@ def main():
     icon = make_icon()
     app.setWindowIcon(icon)
 
+    # Only one copy at a time: if the banner is already running (e.g. it started with
+    # the computer), ask it to show itself and quit.
+    server_name = f"{APP_NAME}-{os.environ.get('USERNAME') or os.environ.get('USER') or 'user'}"
+    probe = QLocalSocket()
+    probe.connectToServer(server_name)
+    if probe.waitForConnected(500):
+        probe.write(b"show")
+        probe.waitForBytesWritten(500)
+        probe.disconnectFromServer()
+        return
+    QLocalServer.removeServer(server_name)  # clear a leftover from a crash
+    server = QLocalServer()
+    server.listen(server_name)
+
     config = Config()
     ctl = Controller(config, icon)
+    ctl.instance_server = server
+    server.newConnection.connect(lambda: (server.nextPendingConnection(), ctl.show_banners()))
+    refresh_autostart()
     if not config.exists:
         QTimer.singleShot(300, lambda: ctl.open_settings(first_run=True))
     sys.exit(app.exec())
