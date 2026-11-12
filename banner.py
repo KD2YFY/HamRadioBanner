@@ -8,7 +8,7 @@ import sys
 import threading
 
 import requests
-from PyQt6.QtCore import QDateTime, QPoint, QStandardPaths, Qt, QTimer, QTimeZone, pyqtSignal
+from PyQt6.QtCore import QDateTime, QFileSystemWatcher, QPoint, QStandardPaths, Qt, QTimer, QTimeZone, pyqtSignal
 from PyQt6.QtGui import QAction, QColor, QFont, QIcon, QPainter, QPixmap
 from PyQt6.QtWidgets import (
     QApplication, QComboBox, QCompleter, QDialog, QDialogButtonBox, QFormLayout, QHBoxLayout,
@@ -53,12 +53,23 @@ def config_path():
 class Config:
     def __init__(self):
         self.path = config_path()
+        self.reload()
+
+    def reload(self):
+        """Re-read config.ini from disk (picks up edits made in a text editor)."""
         self.parser = configparser.ConfigParser()
-        self.exists = bool(self.parser.read(self.path))
+        try:
+            self.exists = bool(self.parser.read(self.path, encoding="utf-8"))
+        except configparser.Error:
+            return False  # half-saved or mistyped file: keep using the current settings
         if not self.parser.has_section("SETTINGS"):
             self.parser.add_section("SETTINGS")
         if not self.parser.has_section("WINDOW"):
             self.parser.add_section("WINDOW")
+        return True
+
+    def settings(self):
+        return {k: self.get(k) for k in DEFAULTS}
 
     def get(self, key):
         return self.parser.get("SETTINGS", key, fallback=DEFAULTS[key]).strip()
@@ -276,11 +287,29 @@ class MissionControlBanner(QWidget):
         self.weather_timer = QTimer(self)
         self.weather_timer.timeout.connect(self.get_weather)
 
+        # Apply hand edits to config.ini right away (e.g. another operator's callsign).
+        self.watcher = QFileSystemWatcher(self)
+        self.watcher.fileChanged.connect(self._on_config_file_changed)
         self.apply_settings()
         self.restore_geometry()
 
     # --- settings ---
+    def _watch_config(self):
+        if os.path.exists(self.config.path) and self.config.path not in self.watcher.files():
+            self.watcher.addPath(self.config.path)
+
+    def _on_config_file_changed(self, _path):
+        # Some editors replace the file on save; wait a moment, then watch it again.
+        QTimer.singleShot(200, self._reload_config)
+
+    def _reload_config(self):
+        self._watch_config()
+        if self.config.reload() and self.config.settings() != self._applied:
+            self.apply_settings()
+
     def apply_settings(self):
+        self._applied = self.config.settings()
+        self._watch_config()
         self.callsign = self.config.get("callsign")
         tz_name = self.config.get("timezone")
         self.tz = QTimeZone(tz_name.encode()) if tz_name else QTimeZone.systemTimeZone()
@@ -357,6 +386,9 @@ class MissionControlBanner(QWidget):
 
     def save_geometry(self):
         if not self.config.exists:
+            return
+        # Re-read first so we never overwrite edits someone made to config.ini by hand.
+        if not self.config.reload():
             return
         w = self.config.parser["WINDOW"]
         w["x"], w["y"] = str(self.x()), str(self.y())

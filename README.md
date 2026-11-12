@@ -70,7 +70,7 @@ All settings can be changed from **Right-click → Settings…**:
 - **Temperature:** °F or °C.
 - **Weather refresh:** how often to update, in minutes.
 
-Settings are saved to `config.ini` next to the program. If you installed with pipx or use the Mac app, they go in your user settings folder instead. See `config.example.ini` for the format.
+Settings are saved to `config.ini` next to the program. You can also edit that file in a text editor; changes (such as a different operator's callsign) show up within a second, no restart needed. If you installed with pipx or use the Mac app, they go in your user settings folder instead. See `config.example.ini` for the format.
 
 ## Credits
 
