@@ -29,8 +29,6 @@ jobs:
             name: HamRadioBanner-Windows
           - os: macos-latest
             name: HamRadioBanner-macOS
-          - os: ubuntu-latest
-            name: HamRadioBanner-Linux
     runs-on: ${{ matrix.os }}
     steps:
       - uses: actions/checkout@v4
@@ -48,9 +46,6 @@ jobs:
             exit 1
           fi
       - run: pip install -r requirements.txt pyinstaller pillow
-      - name: Install Qt's graphics libraries (Linux build machines don't have them)
-        if: runner.os == 'Linux'
-        run: sudo apt-get update && sudo apt-get install -y libegl1 libgl1 libxkbcommon0 libfontconfig1 libdbus-1-3
       - name: Draw the app icon
         run: python tools/make_icons.py icons
       - name: Build
@@ -67,18 +62,66 @@ jobs:
           cd dist
           if [ "$RUNNER_OS" = "Windows" ]; then
             7z a ../${{ matrix.name }}.zip HamRadioBanner config.example.ini README.md
-          elif [ "$RUNNER_OS" = "macOS" ]; then
-            ditto -c -k --keepParent HamRadioBanner.app ../${{ matrix.name }}.zip
           else
-            zip -r ../${{ matrix.name }}.zip HamRadioBanner config.example.ini README.md
+            ditto -c -k --keepParent HamRadioBanner.app ../${{ matrix.name }}.zip
           fi
       - uses: actions/upload-artifact@v4
         with:
           name: ${{ matrix.name }}
           path: ${{ matrix.name }}.zip
 
+  # Linux is built inside an older distribution (Debian 11, glibc 2.31). The app carries the
+  # build machine's libraries with it, and those only run on systems at least as new as the
+  # build machine - so building on the newest Ubuntu made it fail on Mint, Debian, etc.
+  build-linux:
+    runs-on: ubuntu-latest
+    container: python:3.12-slim-bullseye
+    steps:
+      - uses: actions/checkout@v4
+      - name: Check version number matches banner.py
+        if: github.ref_type == 'tag' || inputs.version != ''
+        shell: bash
+        run: |
+          WANT="${{ github.ref_type == 'tag' && github.ref_name || inputs.version }}"
+          HAVE=$(sed -n 's/^__version__ = "\([^"]*\)".*/\1/p' banner.py)
+          if [ "${WANT#v}" != "$HAVE" ]; then
+            echo "::error::You asked to release $WANT but banner.py says __version__ = \"$HAVE\". Update banner.py first."
+            exit 1
+          fi
+      - name: Install the libraries Qt needs (they get bundled into the app)
+        run: |
+          apt-get update
+          apt-get install -y --no-install-recommends zip binutils libegl1 libgl1 libglib2.0-0 \
+            libxkbcommon0 libxkbcommon-x11-0 libfontconfig1 libfreetype6 libdbus-1-3 \
+            libxcb1 libxcb-cursor0 libxcb-icccm4 libxcb-image0 libxcb-keysyms1 libxcb-randr0 \
+            libxcb-render-util0 libxcb-shape0 libxcb-xinerama0 libxcb-xkb1 libx11-xcb1
+      - run: pip install -r requirements.txt pyinstaller pillow
+      - name: Draw the app icon
+        run: python tools/make_icons.py icons
+      - name: Build
+        run: pyinstaller --noconfirm --windowed --onedir --name HamRadioBanner --icon icons/icon.png banner.py
+      - name: Make sure it runs on older Linux (nothing needs a glibc newer than 2.31)
+        shell: bash
+        run: |
+          need=$(find dist/HamRadioBanner -type f \( -name '*.so*' -o -name HamRadioBanner \) \
+                   -exec objdump -T {} \; 2>/dev/null | grep -o 'GLIBC_[0-9.]*' | sort -Vu | tail -1)
+          echo "Highest glibc needed: $need"
+          if [ "$(printf '%s\n' GLIBC_2.31 "$need" | sort -V | tail -1)" != "GLIBC_2.31" ]; then
+            echo "::error::The Linux app needs $need, newer than 2.31 - it would fail on older distributions."
+            exit 1
+          fi
+      - name: Zip
+        run: |
+          cp icons/icon.png dist/HamRadioBanner/icon.png   # used by the installer's menu entry
+          cp config.example.ini README.md dist/
+          cd dist && zip -qr ../HamRadioBanner-Linux.zip HamRadioBanner config.example.ini README.md
+      - uses: actions/upload-artifact@v4
+        with:
+          name: HamRadioBanner-Linux
+          path: HamRadioBanner-Linux.zip
+
   release:
-    needs: build
+    needs: [build, build-linux]
     if: github.ref_type == 'tag' || inputs.version != ''
     runs-on: ubuntu-latest
     steps:

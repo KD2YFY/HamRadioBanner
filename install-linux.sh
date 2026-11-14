@@ -53,7 +53,44 @@ cp -Rf "$tmp/new/HamRadioBanner/." "$APP_DIR/"
 cp -f "$tmp/new/README.md" "$tmp/new/config.example.ini" "$APP_DIR/" 2>/dev/null || true
 chmod +x "$APP_DIR/HamRadioBanner"
 
+# Desktop icon and applications-menu entry (made here, so they exist even before the first run).
+ICON="$APP_DIR/icon.png"
+[ -f "$ICON" ] || ICON="utilities-system-monitor"
+ENTRY="[Desktop Entry]
+Type=Application
+Name=Ham Radio Banner
+Comment=Callsign, UTC/local time, weather and propagation banner
+Exec=\"$APP_DIR/HamRadioBanner\"
+Icon=$ICON
+Terminal=false
+Categories=Utility;HamRadio;"
+MENU_DIR="$HOME/.local/share/applications"
+mkdir -p "$MENU_DIR"
+printf '%s\n' "$ENTRY" > "$MENU_DIR/hamradiobanner.desktop"
+DESKTOP_DIR="$(xdg-user-dir DESKTOP 2>/dev/null || echo "$HOME/Desktop")"
+if [ -d "$DESKTOP_DIR" ]; then
+    printf '%s\n' "$ENTRY" > "$DESKTOP_DIR/hamradiobanner.desktop"
+    chmod +x "$DESKTOP_DIR/hamradiobanner.desktop"
+    # Cinnamon/GNOME only launch desktop icons that are marked as trusted.
+    gio set "$DESKTOP_DIR/hamradiobanner.desktop" metadata::trusted true 2>/dev/null || true
+fi
+update-desktop-database "$MENU_DIR" >/dev/null 2>&1 || true
+
 say "Starting Ham Radio Banner..."
-nohup "$APP_DIR/HamRadioBanner" >/dev/null 2>&1 &
-say "Done! Look for the banner at the top of your screen and its antenna icon in the tray."
-say "It adds a desktop shortcut and a menu entry; right-click the banner for Settings."
+LOG="$APP_DIR/last-start.log"
+nohup "$APP_DIR/HamRadioBanner" >"$LOG" 2>&1 &
+sleep 5
+if ! pgrep -f "$APP_DIR/HamRadioBanner" >/dev/null 2>&1; then
+    say "The banner didn't start. This is what it said:"
+    tail -n 8 "$LOG"
+    if grep -q "GLIBC" "$LOG"; then
+        say "Your Linux is older than this build supports. Please report this at"
+        echo "  https://github.com/KD2YFY/HamRadioBanner/issues"
+    elif grep -qi "xcb" "$LOG"; then
+        say "A display library is missing. Try:  sudo apt install libxcb-cursor0  (or your distro's equivalent)"
+    fi
+    exit 1
+fi
+say "Done! The banner is running - look for it at the top of your screen."
+say "Start it any time from the desktop icon or your applications menu (Ham Radio Banner)."
+echo "Installed in $APP_DIR (a hidden folder - press Ctrl+H in the file manager to see it)."
