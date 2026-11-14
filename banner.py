@@ -31,7 +31,7 @@ from PyQt6.QtWidgets import (
     QTimeEdit, QWidget,
 )
 
-__version__ = "1.6.4"  # must match the version typed when publishing a release
+__version__ = "1.6.5"  # must match the version typed when publishing a release
 APP_NAME = "HamRadioBanner"
 RELEASES_API = os.environ.get("HAMRADIOBANNER_RELEASES_API",  # override is for testing only
                               "https://api.github.com/repos/KD2YFY/HamRadioBanner/releases/latest")
@@ -55,7 +55,8 @@ DEFAULTS = {
     "show_hilo": "yes",       # yes = today's forecast high/low
     "show_24h": "no",         # yes = observed high/low for the 24 hours ending at day_end
     "day_end": "06:30",       # end of the 24-hour high/low period (local time, HH:MM)
-    "wx24_source": "station", # station = NWS (US); model = Open-Meteo; wu / ambient / ecowitt = your own station
+    "wx24_source": "station", # station = NWS (US); model = Open-Meteo; aprs = CWOP via aprs.fi;
+                              # synoptic = Synoptic Data; wu / ambient / ecowitt = your own station
     "station": "",            # NWS ID like KGFL (blank = nearest), WU station ID, or your station's MAC
     "api_key": "",            # your own station's API key (Weather Underground / Ambient / Ecowitt)
     "app_key": "",            # Ambient Weather / Ecowitt application key
@@ -191,6 +192,48 @@ def lookup_location_cached(text):
     result = lookup_location(text)
     _location_cache[text] = (time.time(), result)
     return result
+
+
+def _place_label(r):
+    """'Gansevoort, NY' for US places, 'Albany, Western Australia, AU' elsewhere."""
+    if r.get("country_code") == "US":
+        abbr = next((k for k, v in US_STATES.items() if v.replace("_", " ") == r.get("admin1")), r.get("admin1", ""))
+        return f"{r['name']}, {abbr}" if abbr else r["name"]
+    return ", ".join(x for x in (r.get("name"), r.get("admin1"), r.get("country_code")) if x)
+
+
+def suggest_locations(text, limit=3):
+    """Places with a similar name, for 'Did you mean...?' when a location isn't found
+    (e.g. 'Ganesvoort NY' -> 'Gansevoort, NY'). Returns a list of labels."""
+    import difflib
+    text = " ".join(text.split())
+    if "," in text:
+        parts = [p.strip() for p in text.split(",")]
+        name, hints = parts[0], [p for p in parts[1:] if p]
+    else:
+        words = text.split()
+        tail = words[-1] if len(words) > 1 else ""
+        is_place = tail.upper() in US_STATES or tail.lower() in {v.replace("_", " ").lower() for v in US_STATES.values()}
+        name, hints = (" ".join(words[:-1]), [tail]) if is_place else (text, [])
+    seen, scored = set(), []
+    for prefix in dict.fromkeys((name[:3], name[:4], name[:5])):
+        if len(prefix) < 3:
+            continue
+        try:
+            res = requests.get("https://geocoding-api.open-meteo.com/v1/search", timeout=5,
+                               params={"name": prefix, "count": 100, "language": "en", "format": "json"}).json()
+        except (requests.RequestException, ValueError):
+            continue
+        for r in res.get("results") or []:
+            key = (r.get("name"), r.get("admin1"), r.get("country_code"))
+            if key in seen or (hints and not _matches(r, hints)):
+                continue
+            seen.add(key)
+            score = difflib.SequenceMatcher(None, name.lower(), str(r.get("name", "")).lower()).ratio()
+            if score >= 0.7:
+                scored.append((score, r.get("population") or 0, _place_label(r)))
+    scored.sort(key=lambda x: (-x[0], -x[1]))
+    return [label for _, _, label in scored[:limit]]
 
 
 def lookup_location(text):
@@ -408,6 +451,118 @@ def _ecowitt_readings(mac, api_key, app_key, start_utc, end_utc, offset, units):
     return {"now": now, "temps": temps, "label": "Ecowitt"}
 
 
+# --- citizen weather stations near you (no station of your own needed) ----------------------
+
+CITIZEN_SOURCES = {"aprs": "CWOP / APRS weather (aprs.fi)", "synoptic": "Synoptic Data"}
+_history_lock = threading.Lock()
+
+
+def _history_path():
+    return os.path.join(os.path.dirname(config_path()), "station_history.json")
+
+
+def record_reading(station, epoch, temp_c):
+    """Keep a station's readings (last 48 hours) for stations whose service only gives the
+    latest value, so the banner can work out the 24-hour high/low itself."""
+    import json
+    with _history_lock:
+        try:
+            with open(_history_path(), encoding="utf-8") as f:
+                data = json.load(f)
+        except (OSError, ValueError):
+            data = {}
+        rows = {int(t): v for t, v in data.get(station, [])}
+        rows[int(epoch)] = float(temp_c)
+        cutoff = time.time() - 48 * 3600
+        data[station] = sorted([t, v] for t, v in rows.items() if t >= cutoff)
+        try:
+            with open(_history_path(), "w", encoding="utf-8") as f:
+                json.dump(data, f)
+        except OSError:
+            pass
+        return data[station]
+
+
+def _aprs_latest(call, api_key):
+    """Latest weather report from a CWOP/APRS station via the aprs.fi API (free account).
+    Returns (epoch, temp_c)."""
+    if not call or not api_key:
+        raise ValueError("aprs.fi needs a station (callsign or CWOP ID) and your aprs.fi API key")
+    r = requests.get("https://api.aprs.fi/api/get", timeout=15,
+                     params={"name": call, "what": "wx", "apikey": api_key, "format": "json"},
+                     headers={"User-Agent": f"{APP_NAME}/{__version__} (+https://github.com/KD2YFY/HamRadioBanner)"})
+    r.raise_for_status()
+    body = r.json()
+    if body.get("result") != "ok":
+        raise ValueError(f"aprs.fi: {body.get('description') or 'request failed'}")
+    entries = body.get("entries") or []
+    if not entries or entries[0].get("temp") in (None, ""):
+        raise ValueError(f"aprs.fi has no temperature reports from {call}")
+    return int(entries[0]["time"]), float(entries[0]["temp"])
+
+
+def _aprs_readings(call, api_key, start_utc, end_utc, units):
+    call = call.strip().upper()
+    epoch, temp_c = _aprs_latest(call, api_key)
+    history = record_reading(call, epoch, temp_c)
+    conv = (lambda c: c) if units == "C" else (lambda c: c * 9 / 5 + 32)
+    fresh = time.time() - epoch < 2 * 3600
+    s, e = start_utc.timestamp(), end_utc.timestamp()
+    inside = [(t, v) for t, v in history if s <= t <= e]
+    # Only trust the high/low if readings cover the whole day without a long gap (e.g. the
+    # computer was off overnight and missed the low).
+    stamps = [s] + [t for t, _ in inside] + [e]
+    covered = len(inside) >= 12 and max(b - a for a, b in zip(stamps, stamps[1:])) <= 2 * 3600
+    # How much unbroken history there is (since the last gap of over 2 hours).
+    run_start = history[-1][0] if history else time.time()
+    for (t0, _), (t1, _) in zip(reversed(history[:-1]), reversed(history[1:])):
+        if t1 - t0 > 2 * 3600:
+            break
+        run_start = t0
+    have_hours = (min(e, time.time()) - max(run_start, s)) / 3600 if history else 0
+    return {"now": conv(temp_c) if fresh else None, "label": call,
+            "temps": [conv(v) for _, v in inside] if covered else [],
+            "collecting": None if covered else max(0, min(24, int(have_hours)))}
+
+
+def _synoptic_readings(stid, token, lat, lon, start_utc, end_utc, units):
+    """Synoptic Data API (free open-access token). Blank station = nearest active station."""
+    if not token:
+        raise ValueError("Synoptic Data needs your API token (free at synopticdata.com)")
+    base = "https://api.synopticdata.com/v2/stations"
+
+    def get(path, **params):
+        r = requests.get(f"{base}/{path}", params={"token": token, "vars": "air_temp", **params}, timeout=20)
+        r.raise_for_status()
+        body = r.json()
+        summary = body.get("SUMMARY") or {}
+        if summary.get("RESPONSE_CODE") != 1:
+            raise ValueError(f"Synoptic Data: {summary.get('RESPONSE_MESSAGE') or 'request failed'}")
+        return body.get("STATION") or []
+
+    stid = stid.strip().upper()
+    if not stid:  # the nearest active station reporting temperature, within 15 miles
+        near = get("latest", radius=f"{lat:.4f},{lon:.4f},15", limit=1, status="active")
+        if not near:
+            raise ValueError("Synoptic Data found no station within 15 miles")
+        stid = near[0]["STID"]
+    now_utc = datetime.now(timezone.utc)
+    st = get("timeseries", stid=stid, start=start_utc.strftime("%Y%m%d%H%M"),
+             end=max(end_utc, now_utc).strftime("%Y%m%d%H%M"), obtimezone="UTC", units="metric")
+    if not st:
+        raise ValueError(f"Synoptic Data has no readings for {stid}")
+    obs = st[0].get("OBSERVATIONS") or {}
+    times = obs.get("date_time") or []
+    values = next((v for k, v in obs.items() if k.startswith("air_temp_set")), [])
+    conv = (lambda c: c) if units == "C" else (lambda c: c * 9 / 5 + 32)
+    readings = [(datetime.fromisoformat(t.replace("Z", "+00:00")), v) for t, v in zip(times, values) if v is not None]
+    temps = [conv(v) for t, v in readings if start_utc <= t <= end_utc]
+    now = None
+    if readings and now_utc - readings[-1][0] < timedelta(hours=2):
+        now = conv(readings[-1][1])
+    return {"now": now, "temps": temps, "label": stid, "collecting": None}
+
+
 def pws_readings(source, station, api_key, app_key, start_utc, end_utc, offset, units):
     if source == "wu":
         return _wu_readings(station, api_key, start_utc, end_utc, offset, units)
@@ -507,23 +662,32 @@ def fetch_weather(location, units, day_end="06:30", source="station", station=""
             except Exception as e:  # station offline most of the day...
                 print(f"NWS station data unavailable, using model data: {e!r}", file=sys.stderr)
                 out["source24"], out["station_error"] = "model (no station)", str(e)
-    elif source in PWS_SOURCES:
-        # Your own station: current temperature and the 24-hour high/low.
+    elif source in PWS_SOURCES or source in CITIZEN_SOURCES:
+        # Your own station, or a citizen station near you: current temperature and 24-hour high/low.
         try:
             offset = timedelta(seconds=out["utc_offset"])
             to_utc = lambda local: (local - offset).replace(tzinfo=timezone.utc)
-            got = pws_readings(source, station.strip(), api_key.strip(), app_key.strip(),
-                               to_utc(start), to_utc(end), offset, units)
+            if source == "aprs":
+                got = _aprs_readings(station, api_key.strip(), to_utc(start), to_utc(end), units)
+            elif source == "synoptic":
+                got = _synoptic_readings(station, api_key.strip(), lat, lon, to_utc(start), to_utc(end), units)
+            else:
+                got = pws_readings(source, station.strip(), api_key.strip(), app_key.strip(),
+                                   to_utc(start), to_utc(end), offset, units)
             if got["now"] is not None and station_current:
                 out["now"], out["now_source"] = got["now"], got["label"]
-            if len(got["temps"]) >= 12:
+            tag = "home" if source in PWS_SOURCES else got["label"]
+            if got.get("collecting") is not None:
+                # aprs.fi only gives the latest reading: the banner is still building a day of history.
+                out["source24"], out["collecting"] = f"collecting {tag}", got["collecting"]
+            elif len(got["temps"]) >= 12:
                 out["hi24"], out["lo24"] = max(got["temps"]), min(got["temps"])
-                out["source24"], out["readings24"] = "home", len(got["temps"])
+                out["source24"], out["readings24"] = tag, len(got["temps"])
             else:
                 out["source24"] = "model (no station)"
                 out["station_error"] = f"only {len(got['temps'])} readings in the 24 hours"
         except Exception as e:
-            print(f"Home station data unavailable, using model data: {e!r}", file=sys.stderr)
+            print(f"Station data unavailable, using model data: {e!r}", file=sys.stderr)
             out["source24"] = "model (no station)"
             out["station_error"] = str(e)
     return out
@@ -1384,6 +1548,8 @@ class SettingsDialog(QDialog):
 
         self.wx24_source = QComboBox()
         self._sources = [("station", "NWS weather station (US)"), ("model", "Weather model (worldwide)"),
+                         ("aprs", "CWOP / APRS weather near you (aprs.fi)"),
+                         ("synoptic", "Synoptic Data: stations near you"),
                          ("wu", "My station: Weather Underground"), ("ambient", "My station: Ambient Weather"),
                          ("ecowitt", "My station: Ecowitt")]
         self.wx24_source.addItems([label for _, label in self._sources])
@@ -1420,6 +1586,8 @@ class SettingsDialog(QDialog):
         self.key_note = QLabel()
         self.key_note.setStyleSheet("color: #9aa4b2; font-size: 11px;")
         self.key_note.setWordWrap(True)
+        self.key_note.setOpenExternalLinks(True)  # the "Sign up" links open in the browser
+
         test_row.addWidget(self.test_button)
         test_row.addWidget(self.key_note, 1)
         form.addRow("", test_row)
@@ -1524,6 +1692,16 @@ class SettingsDialog(QDialog):
         hints = {
             "station": ("auto", "", "", "Blank = the NWS station nearest your weather location, or an ID like KGFL."),
             "model": ("", "", "", "Model data needs no station."),
+            "aprs": ("callsign or CWOP ID, e.g. KD2XXX-13", "aprs.fi API key", "",
+                     "Backyard stations from the Citizen Weather Observer Program (many also feed Weather "
+                     "Underground). <a href='https://aprs.fi/'>Sign up free at aprs.fi</a>, then copy the key "
+                     "from Account settings. Find a station near you on the aprs.fi map (weather stations "
+                     "have a WX icon). aprs.fi only gives the latest reading, so the 24-hour high/low appears "
+                     "after the banner has run for a day."),
+            "synoptic": ("blank = nearest", "API token", "",
+                         "Combines 100,000+ stations (CWOP, schools, DOT road sensors...). "
+                         "<a href='https://synopticdata.com/open-access'>Request a free open-access token</a>, then "
+                         "paste it here. Leave Station ID blank for the nearest station, or enter its ID."),
             "wu": ("e.g. KNYWARRE12", "API key", "",
                    "From wunderground.com > My Profile > API Keys (free for station owners). "
                    "Davis, Acurite and others that upload to WU work this way too."),
@@ -1535,8 +1713,10 @@ class SettingsDialog(QDialog):
         self.station.setPlaceholderText(hints[0])
         self.api_key.setPlaceholderText(hints[1])
         self.app_key.setPlaceholderText(hints[2])
-        self.key_note.setText(hints[3])
-        uses_station, uses_api, uses_app = src != "model", src in PWS_SOURCES, src in ("ambient", "ecowitt")
+        self.key_note.setText(hints[3].replace("<a href", "<a style='color:#409EFF;' href"))
+        uses_station = src != "model"
+        uses_api = src in PWS_SOURCES or src in CITIZEN_SOURCES
+        uses_app = src in ("ambient", "ecowitt")
         for field, used in ((self.station, uses_station), (self.api_key, uses_api), (self.app_key, uses_app),
                             (self.station_current, uses_station)):
             self._form.setRowVisible(field, used)  # only show the fields this source needs
@@ -1554,7 +1734,11 @@ class SettingsDialog(QDialog):
                               self.api_key.text(), self.app_key.text(), True, True)
         except Exception as e:
             QApplication.restoreOverrideCursor()
-            QMessageBox.warning(self, "Test station", f"Couldn't get the weather:\n{e}")
+            if isinstance(e, LocationNotFound):
+                QMessageBox.warning(self, "Test station", f"Couldn't find the weather location \"{e}\".\n"
+                                    "Check the spelling, or use a ZIP code (e.g. 12831) or coordinates.")
+            else:
+                QMessageBox.warning(self, "Test station", f"Couldn't get the weather:\n{e}")
             return
         QApplication.restoreOverrideCursor()
         unit = "°C" if self.units.currentIndex() == 1 else "°F"
@@ -1562,8 +1746,20 @@ class SettingsDialog(QDialog):
             QMessageBox.warning(self, "Test station", "The station didn't answer, so the model data would be used.\n\n"
                                 f"Reason: {w.get('station_error') or 'no NWS station data for this location'}")
             return
-        src_name = w["source24"] if src == "station" else PWS_SOURCES[src]
+        if src == "station":
+            src_name = f"NWS station {w['source24']}"
+        elif src in CITIZEN_SOURCES:
+            src_name = f"{w.get('now_source') or w['source24'].split()[-1]} via {CITIZEN_SOURCES[src]}"
+        else:
+            src_name = PWS_SOURCES[src]
         lines = [f"Connected to {src_name}."]
+        if w.get("source24", "").startswith("collecting"):
+            if w.get("now_source"):
+                lines.append(f"Current temperature: {round(w['now'])}{unit}")
+            lines.append(f"24-hour high/low: collecting readings ({w.get('collecting', 0)}h of 24 so far). "
+                         "It appears once the banner has a full day of readings.")
+            QMessageBox.information(self, "Test station", "\n".join(lines))
+            return
         if w.get("now_source"):
             lines.append(f"Current temperature: {round(w['now'])}{unit}"
                          + (f" ({w['conditions']})" if src == "station" and w.get("conditions") else ""))
@@ -1587,7 +1783,55 @@ class SettingsDialog(QDialog):
         except Exception as e:
             QMessageBox.warning(self, "Desktop shortcut", f"Could not create the shortcut:\n{e}")
 
+    def _location_ok(self):
+        """Check a newly typed weather location before saving; offer 'Did you mean...?'.
+        Returns False to stay in the dialog."""
+        text = " ".join(self.location.text().split())
+        if not text or text == " ".join(self.config.get("location").split()) or not self.show_weather.isChecked():
+            return True
+        parts = [p.strip() for p in text.split(",")]
+        if len(parts) == 2:
+            try:
+                float(parts[0]), float(parts[1])
+                return True  # coordinates
+            except ValueError:
+                pass
+        from PyQt6.QtGui import QCursor
+        QApplication.setOverrideCursor(QCursor(Qt.CursorShape.WaitCursor))
+        try:
+            lookup_location_cached(text)
+            return True
+        except LocationNotFound:
+            suggestions = suggest_locations(text)
+        except Exception:
+            return True  # offline: can't check now, the banner will say if it fails later
+        finally:
+            QApplication.restoreOverrideCursor()
+        box = QMessageBox(QMessageBox.Icon.Warning, "Weather location", f"Couldn't find \"{text}\".", parent=self)
+        use = None
+        if suggestions:
+            box.setInformativeText("Did you mean " + " or ".join(suggestions) + "?\n\n"
+                                   "You can also use a ZIP code (e.g. 12831) or coordinates.")
+            use = box.addButton(f"Use {suggestions[0]}", QMessageBox.ButtonRole.AcceptRole)
+        else:
+            box.setInformativeText("Check the spelling, or use a ZIP code (e.g. 12831) or coordinates "
+                                   "like 43.10, -73.65.")
+        back = box.addButton("Edit location", QMessageBox.ButtonRole.RejectRole)
+        box.addButton("Save anyway", QMessageBox.ButtonRole.DestructiveRole)
+        box.setDefaultButton(use or back)
+        box.exec()
+        if box.clickedButton() is use:
+            self.location.setText(suggestions[0])
+            return True
+        if box.clickedButton() is back:
+            self.location.setFocus()
+            self.location.selectAll()
+            return False
+        return True
+
     def accept(self):
+        if not self._location_ok():
+            return
         tz = self.timezone.currentText().strip()
         if not QTimeZone(tz.encode()).isValid():
             QMessageBox.warning(self, "Unknown timezone",
@@ -1668,7 +1912,7 @@ class Controller(QObject):
         # Shared menu used by every banner and the tray icon.
         self.menu = QMenu()
         self.menu.addAction("Settings…", lambda: self.open_settings())
-        self.menu.addAction("Refresh Weather", self.get_weather)
+        self.menu.addAction("Refresh Weather", lambda: self.get_weather(force=True))
         self.menu.addAction("Check for Updates…", lambda: self.check_update(manual=True))
         self.menu_banner = None  # the banner that was right-clicked
         self.match_size_action = self.menu.addAction("Make all banners this size", self.match_size)
@@ -1692,6 +1936,11 @@ class Controller(QObject):
         self.rollover_timer = QTimer(self)
         self.rollover_timer.timeout.connect(self._check_day_rollover)
         self.rollover_timer.start(60 * 1000)
+        # aprs.fi only gives a station's latest report, so sample it every 10 minutes to build
+        # the 24-hour history (CWOP stations report every 5-10 minutes).
+        self.sample_timer = QTimer(self)
+        self.sample_timer.timeout.connect(self._sample_aprs)
+        self.sample_timer.start(10 * 60 * 1000)
         self.clock_timer.start(1000)
         # Other programs (full-screen apps, other "on top" windows, waking from sleep) can
         # push the banner down, so quietly put it back on top every couple of seconds.
@@ -1760,7 +2009,9 @@ class Controller(QObject):
                 ("location", "units", "show_24h", "day_end", "show_weather", "wx24_source", "station",
                  "api_key", "app_key", "station_current"))
                 or not old):
-            self.get_weather()
+            if old and any(old.get(k) != self._applied[k] for k in ("location", "units")):
+                self.weather, self.weather_error = None, "Loading WX..."  # don't show the old place
+            self.get_weather(force=True)
         if old and any(old.get(k) != self._applied[k] for k in
                        ("font_callsign", "font_clock", "font_weather", "font_ticker", "show_weather",
                         "font_clock_label", "font_weather_label", "font_date", "font_conditions",
@@ -1851,10 +2102,20 @@ class Controller(QObject):
             self.save_geometry(b)
 
     # --- weather (runs in background so the clock never freezes) ---
-    def get_weather(self):
-        if self._fetching or not _yes(self.config.get("show_weather")):
+    def _weather_key(self):
+        """The settings a weather reading depends on; if these change, old readings are wrong."""
+        return tuple(self.config.get(k) for k in ("location", "units", "wx24_source", "station",
+                                                  "station_current", "day_end"))
+
+    def get_weather(self, force=False):
+        """Download the weather in the background. Timer refreshes skip if one is already running;
+        a forced refresh (settings changed, Refresh Weather) always starts a new one, and only
+        the newest request's result is shown."""
+        if not _yes(self.config.get("show_weather")) or (self._fetching and not force):
             return
         self._fetching = True
+        self._wx_gen = getattr(self, "_wx_gen", 0) + 1
+        gen, key = self._wx_gen, self._weather_key()
         location, units = self.config.get("location"), self.config.get("units").upper()
         day_end = self.config.get("day_end")
         source, station = self.config.get("wx24_source").lower(), self.config.get("station")
@@ -1865,25 +2126,46 @@ class Controller(QObject):
             try:
                 text = fetch_weather(location, units, day_end, source, station, *keys, use_now, want24)
             except LocationNotFound:
-                text = ("<span style='color:#888;'>Location not found - "
-                        "right-click &gt; Settings</span>")
+                text = ("<span style='color:#888;'>Location not found - check the spelling or use a "
+                        "ZIP code (right-click &gt; Settings)</span>")
             except requests.RequestException as e:
                 print(f"Weather error: {e}", file=sys.stderr)
                 text = "<span style='color:#888;'>WX Unavailable (no connection)</span>"
             except Exception as e:  # unexpected reply from the weather service
                 print(f"Weather error: {e!r}", file=sys.stderr)
                 text = "<span style='color:#888;'>WX Unavailable</span>"
-            self._weather_ready.emit(text)  # a dict of readings, or an error message
+            self._weather_ready.emit((gen, key, text))  # text = a dict of readings, or an error message
 
         threading.Thread(target=work, daemon=True).start()
 
-    def _on_weather(self, result):
+    def _on_weather(self, message):
+        gen, key, result = message
+        if gen != self._wx_gen:
+            return  # an older request finished late: a newer one is on its way
         self._fetching = False
         if isinstance(result, dict):
-            self.weather, self.weather_error = result, None
+            self.weather, self.weather_error, self._weather_for = result, None, key
         else:
             self.weather_error = result
+            # Keep showing the last good reading only through a brief network hiccup for the
+            # same place - never when the location changed or can't be found.
+            if "not found" in result or getattr(self, "_weather_for", None) != key:
+                self.weather = None
         self.changed.emit()
+
+    def _sample_aprs(self):
+        if self.config.get("wx24_source").lower() != "aprs" or not _yes(self.config.get("show_weather")):
+            return
+        call, key = self.config.get("station").upper(), self.config.get("api_key")
+
+        def work():
+            try:
+                epoch, temp_c = _aprs_latest(call, key)
+                record_reading(call, epoch, temp_c)
+            except Exception as e:
+                print(f"aprs.fi sample failed: {e!r}", file=sys.stderr)
+
+        threading.Thread(target=work, daemon=True).start()
 
     def _check_day_rollover(self):
         """Refresh right after the 24-hour period rolls over (e.g. at 6:30 AM)."""
@@ -1923,7 +2205,10 @@ class Controller(QObject):
                 tag = f"24h home→{ends}"            # your own weather station
             else:
                 tag = f"24h {src}→{ends}"           # real station readings, e.g. KGFL
-            if w.get("hi24") is None:
+            if src.startswith("collecting"):
+                html += (f"<span style='color:#888; font-size:{lbl};'>&nbsp;24h {escape(src.split(' ', 1)[1])}: "
+                         f"collecting ({w.get('collecting', 0)}h of 24)</span>")
+            elif w.get("hi24") is None:
                 html += f"<span style='color:#888; font-size:{lbl};'>24h n/a</span>"
             else:
                 html += (f"<span style='color:#888; font-size:{lbl};'>&nbsp;{escape(tag)}</span> "

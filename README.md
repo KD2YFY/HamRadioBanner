@@ -84,7 +84,7 @@ All settings can be changed from **Right-click → Settings…**:
 
 - **Callsign:** your amateur radio callsign.
 - **Local timezone:** start typing to search, e.g. `New_York` or `London`.
-- **Weather location:** leave blank to detect it automatically. You can also enter a town and state such as `Warrensburg NY` or `Albany, NY`, a ZIP code such as `12885`, a place such as `London, United Kingdom`, or coordinates such as `42.65, -73.75`. Include the state, since many towns share a name.
+- **Weather location:** leave blank to detect it automatically. If a place name isn't found, Settings offers the closest match (e.g. *Did you mean Gansevoort, NY?*); a ZIP code always works. You can also enter a town and state such as `Warrensburg NY` or `Albany, NY`, a ZIP code such as `12885`, a place such as `London, United Kingdom`, or coordinates such as `42.65, -73.75`. Include the state, since many towns share a name.
 - **Temperature:** °F or °C.
 - **Weather refresh:** how often to update, in minutes.
 - **Weather:** untick **Show weather** to remove the weather from the banner completely. Nothing is downloaded for it while it's off.
@@ -94,6 +94,12 @@ All settings can be changed from **Right-click → Settings…**:
 - **Station data:** where the 24-hour high/low comes from. The banner shows the source: `24h KGFL→6:30a`, `24h home→6:30a`, or `24h model→6:30a` when it had to fall back to the model.
   - **NWS weather station (US):** real thermometer readings from an official National Weather Service station, usually the nearest airport. Leave **Station ID** blank to use the nearest one, or type an ID such as `KGFL` or `KALB`. No account needed. Outside the US, it falls back to the model.
   - **Weather model:** Open-Meteo's 15-minute model data for your location, anywhere in the world.
+  - **CWOP / APRS weather near you (aprs.fi):** backyard stations from the Citizen Weather Observer Program; many of them also feed Weather Underground. You don't need a station of your own.
+    1. Sign up free at [aprs.fi](https://aprs.fi/) and copy your API key from *Account settings*.
+    2. Find a station near you on the aprs.fi map (weather stations have a WX icon) and enter its callsign or CWOP ID, e.g. `KD2XXX-13` or `EW1234`.
+
+    aprs.fi only gives the *latest* reading, so the banner records the station every 10 minutes and shows the 24-hour high/low once it has a full day of readings. Until then it shows *collecting (6h of 24)*. If the computer is off for more than 2 hours, it collects again rather than show a high/low that may have missed the overnight low.
+  - **Synoptic Data, stations near you:** combines 100,000+ stations (CWOP backyard stations, schools, DOT road sensors…) with full history, so the 24-hour high/low works right away. [Request a free open-access token](https://synopticdata.com/open-access) and paste it in. Leave **Station ID** blank for the nearest station within 15 miles, or enter one.
   - **My station:** your own home weather station. It supplies both the current temperature and the 24-hour high/low. Click **Test station** to check that it connects.
     - **Weather Underground:** your station ID (like `KNYWARRE12`) and the API key from *wunderground.com → My Profile → API Keys*, which is free for station owners. Davis, Acurite and other stations that upload to Weather Underground work this way.
     - **Ambient Weather:** an API key and an Application key from *ambientweather.net → Account → API Keys*. A MAC address is needed only if you have more than one station.
