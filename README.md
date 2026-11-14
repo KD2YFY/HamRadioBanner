@@ -89,8 +89,23 @@ All settings can be changed from **Right-click → Settings…**:
 - **Weather refresh:** how often to update, in minutes.
 - **Weather:** untick **Show weather** to remove the weather from the banner completely. Nothing is downloaded for it while it's off.
 - **High/low:** show or hide today's forecast high and low.
-- **24-hour:** show the highest and lowest temperatures over the 24 hours ending at a set time. The default is 6:30 AM, like a daily weather observation, and you can change it. It's shown as `24h→6:30a H:52° L:29°` and rolls over to the new day at that time. The readings come from Open-Meteo's 15-minute model data for your location, not from a weather station.
-- **Text sizes:** font sizes in points, like in a document, for the **callsign** (default 14 pt), the **clocks** (18 pt; the date and labels scale with them), the **weather** (14 pt) and the **ticker** (11 pt). Any size from 6 to 72 pt works, and the banner resizes to fit.
+- **24-hour:** show the highest and lowest temperatures over the 24 hours ending at a set time. The default is 6:30 AM, like a daily weather observation, and you can change it. It rolls over to the new day at that time.
+- **Station data:** where the 24-hour high/low comes from. The banner shows the source: `24h KGFL→6:30a`, `24h home→6:30a`, or `24h model→6:30a` when it had to fall back to the model.
+  - **NWS weather station (US):** real thermometer readings from an official National Weather Service station, usually the nearest airport. Leave **Station ID** blank to use the nearest one, or type an ID such as `KGFL` or `KALB`. No account needed. Outside the US, it falls back to the model.
+  - **Weather model:** Open-Meteo's 15-minute model data for your location, anywhere in the world.
+  - **My station:** your own home weather station. It supplies both the current temperature and the 24-hour high/low. Click **Test station** to check that it connects.
+    - **Weather Underground:** your station ID (like `KNYWARRE12`) and the API key from *wunderground.com → My Profile → API Keys*, which is free for station owners. Davis, Acurite and other stations that upload to Weather Underground work this way.
+    - **Ambient Weather:** an API key and an Application key from *ambientweather.net → Account → API Keys*. A MAC address is needed only if you have more than one station.
+    - **Ecowitt:** your station's MAC address, plus the API key and Application key from *ecowitt.net → User Profile → Private Center*.
+
+    Your keys are saved in `config.ini` on your own computer and are only sent to your station's service.
+- **Text sizes:** font sizes in points, like in a document. Any size from 6 to 72 pt works, and the banner resizes to fit. The defaults are:
+  - **Callsign:** 14 pt
+  - **Clock times:** 18 pt; the date scales with them
+  - **Clock labels** ("UTC", "New York"): 8 pt
+  - **Temperatures:** 14 pt; this covers the town name and the readings
+  - **WX labels** ("WX", "24h"): 8 pt
+  - **Ticker:** 11 pt
 - **Show on:** *One screen*, or *Every screen* for a separate banner on each monitor. Drag each banner where you want it on its monitor; every position is remembered, and banners appear or disappear as you plug in or unplug monitors.
 - **Install updates automatically:** install new versions without asking. See [Updating](#updating).
 - **Show solar & band conditions ticker:** off by default. When ticked, a second line scrolls under the clock. It shows SFI, sunspots, A and K index, X-ray, solar wind, Bz, geomagnetic field and noise. It also shows HF band conditions for day and night, and a VHF outlook: Aurora Likely or Watch, Possible 6m F2, E-skip Season, or Flat/Tropo. The VHF outlook is based on NOAA's aurora model, the 30-minute Bz and the Kp forecast, plus HamQSL's sporadic-E flags. Colors run green (good), yellow (fair) and red (poor). The data refreshes hourly.

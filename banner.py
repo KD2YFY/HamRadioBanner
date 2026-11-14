@@ -31,7 +31,7 @@ from PyQt6.QtWidgets import (
     QTimeEdit, QWidget,
 )
 
-__version__ = "1.6.1"  # must match the version typed when publishing a release
+__version__ = "1.6.2"  # must match the version typed when publishing a release
 APP_NAME = "HamRadioBanner"
 RELEASES_API = os.environ.get("HAMRADIOBANNER_RELEASES_API",  # override is for testing only
                               "https://api.github.com/repos/KD2YFY/HamRadioBanner/releases/latest")
@@ -43,12 +43,18 @@ DEFAULTS = {
     "units": "F",             # F or C
     "font_callsign": "14",    # text sizes in points (like a document), 6-72
     "font_clock": "18",       #   UTC & local clocks (the date and labels scale with it)
-    "font_weather": "14",
+    "font_weather": "14",     #   town name and temperatures
+    "font_clock_label": "8",  #   the "UTC" and "New York" labels
+    "font_weather_label": "8",  # the "WX" and "24h" labels
     "font_ticker": "11",      #   solar & band-conditions ticker
     "show_weather": "yes",    # no = hide the weather completely (and don't download it)
     "show_hilo": "yes",       # yes = today's forecast high/low
     "show_24h": "no",         # yes = observed high/low for the 24 hours ending at day_end
     "day_end": "06:30",       # end of the 24-hour high/low period (local time, HH:MM)
+    "wx24_source": "station", # station = NWS (US); model = Open-Meteo; wu / ambient / ecowitt = your own station
+    "station": "",            # NWS ID like KGFL (blank = nearest), WU station ID, or your station's MAC
+    "api_key": "",            # your own station's API key (Weather Underground / Ambient / Ecowitt)
+    "app_key": "",            # Ambient Weather / Ecowitt application key
     "location": "",           # blank = detect from IP; or "City, State" or "lat, lon"
     "screens": "one",         # one = a single banner; all = a banner on every monitor
     "auto_update": "no",      # yes = install new versions without asking
@@ -236,7 +242,157 @@ def window_end(now_local, day_end):
     return end
 
 
-def fetch_weather(location, units, day_end="06:30"):
+NWS_API = "https://api.weather.gov"
+_NWS_HEADERS = {"User-Agent": f"{APP_NAME}/{__version__} (github.com/KD2YFY/HamRadioBanner)",
+                "Accept": "application/geo+json"}
+_station_cache = {}
+
+
+def nearest_nws_station(lat, lon):
+    """ID of the NWS observation station nearest a point (US only), remembered for a day."""
+    key = (round(lat, 2), round(lon, 2))
+    hit = _station_cache.get(key)
+    if hit and time.time() - hit[0] < 86400:
+        return hit[1]
+    point = requests.get(f"{NWS_API}/points/{lat:.4f},{lon:.4f}", headers=_NWS_HEADERS, timeout=10)
+    point.raise_for_status()
+    stations = requests.get(point.json()["properties"]["observationStations"],
+                            headers=_NWS_HEADERS, timeout=10)
+    stations.raise_for_status()
+    station = stations.json()["features"][0]["properties"]["stationIdentifier"]
+    _station_cache[key] = (time.time(), station)
+    return station
+
+
+def nws_high_low(station, start_utc, end_utc, units):
+    """Highest/lowest temperature a real NWS station reported between two UTC times.
+    Returns (high, low, number_of_readings)."""
+    res = requests.get(f"{NWS_API}/stations/{station}/observations", headers=_NWS_HEADERS, timeout=15,
+                       params={"start": start_utc.strftime("%Y-%m-%dT%H:%M:%SZ"),
+                               "end": end_utc.strftime("%Y-%m-%dT%H:%M:%SZ")})
+    res.raise_for_status()
+    temps = []
+    for f in res.json().get("features", []):
+        props = f.get("properties", {})
+        t = (props.get("temperature") or {}).get("value")
+        if t is None or str(props.get("temperature", {}).get("qualityControl", "")) in ("X", "Q"):
+            continue  # missing, or failed the NWS quality checks
+        when = datetime.fromisoformat(props["timestamp"].replace("Z", "+00:00"))
+        if start_utc <= when <= end_utc:
+            temps.append(t if units == "C" else t * 9 / 5 + 32)
+    if len(temps) < 12:  # a station that was down most of the day isn't worth showing
+        raise ValueError(f"only {len(temps)} readings from {station}")
+    return max(temps), min(temps), len(temps)
+
+
+# --- your own weather station -------------------------------------------------------------
+# Each returns {"now": current temp or None, "temps": [readings in the window], "label": text}.
+# Temperatures come back in the units asked for ("F" or "C").
+
+PWS_SOURCES = {"wu": "Weather Underground", "ambient": "Ambient Weather", "ecowitt": "Ecowitt"}
+
+
+def _f_to(units, f):
+    return f if units == "F" else (f - 32) * 5 / 9
+
+
+def _wu_readings(station, api_key, start_utc, end_utc, offset, units):
+    """Weather Underground PWS API (api.weather.com). Needs your station ID and the API key
+    from wunderground.com > My Profile > API Keys (free for station owners)."""
+    if not station or not api_key:
+        raise ValueError("Weather Underground needs your station ID and API key")
+    base = "https://api.weather.com/v2/pws"
+    u, key = ("e", "imperial") if units == "F" else ("m", "metric")
+    common = {"stationId": station, "format": "json", "units": u, "apiKey": api_key, "numericPrecision": "decimal"}
+    temps = []
+    # History is by the station's local date, so ask for each day the window touches.
+    day = (start_utc + offset).date()
+    while day <= (end_utc + offset).date():
+        r = requests.get(f"{base}/history/all", params={**common, "date": day.strftime("%Y%m%d")}, timeout=15)
+        if r.status_code == 401:
+            raise ValueError("Weather Underground rejected the API key")
+        r.raise_for_status()
+        for o in (r.json() if r.content else {}).get("observations", []):
+            when = datetime.fromisoformat(o["obsTimeUtc"].replace("Z", "+00:00"))
+            vals = o.get(key) or {}
+            if start_utc <= when <= end_utc:
+                temps += [v for v in (vals.get("tempHigh"), vals.get("tempLow")) if v is not None]
+        day += timedelta(days=1)
+    now = None
+    r = requests.get(f"{base}/observations/current", params=common, timeout=15)
+    if r.ok and r.content:
+        obs = r.json().get("observations") or [{}]
+        now = (obs[0].get(key) or {}).get("temp")
+    return {"now": now, "temps": temps, "label": station}
+
+
+def _ambient_readings(mac, api_key, app_key, start_utc, end_utc, units):
+    """Ambient Weather API. Needs an API key and an Application key, both created at
+    ambientweather.net > Account > API Keys. MAC is only needed with more than one station."""
+    if not api_key or not app_key:
+        raise ValueError("Ambient Weather needs your API key and Application key")
+    base = "https://rt.ambientweather.net/v1/devices"
+    keys = {"apiKey": api_key, "applicationKey": app_key}
+    r = requests.get(base, params=keys, timeout=15)
+    if r.status_code == 401:
+        raise ValueError("Ambient Weather rejected the API key or Application key")
+    r.raise_for_status()
+    devices = r.json()
+    dev = next((d for d in devices if not mac or d.get("macAddress", "").upper() == mac.upper()), None)
+    if dev is None:
+        raise ValueError("no Ambient Weather station found" + (f" with MAC {mac}" if mac else ""))
+    time.sleep(1.1)  # Ambient allows one request per second
+    end_ms = int(end_utc.timestamp() * 1000)
+    r = requests.get(f"{base}/{dev['macAddress']}", params={**keys, "endDate": end_ms, "limit": 290}, timeout=15)
+    r.raise_for_status()
+    temps = []
+    for rec in r.json():
+        when = datetime.fromtimestamp(rec.get("dateutc", 0) / 1000, timezone.utc)
+        if rec.get("tempf") is not None and start_utc <= when <= end_utc:
+            temps.append(_f_to(units, rec["tempf"]))
+    last = (dev.get("lastData") or {}).get("tempf")
+    name = (dev.get("info") or {}).get("name") or "Ambient"
+    return {"now": None if last is None else _f_to(units, last), "temps": temps, "label": name}
+
+
+def _ecowitt_readings(mac, api_key, app_key, start_utc, end_utc, offset, units):
+    """Ecowitt API v3. Needs the Application key and API key from ecowitt.net > User Profile >
+    Private Center, and the station's MAC address (shown on ecowitt.net under the device)."""
+    if not (mac and api_key and app_key):
+        raise ValueError("Ecowitt needs your station's MAC address, API key and Application key")
+    base = "https://api.ecowitt.net/api/v3/device"
+    common = {"application_key": app_key, "api_key": api_key, "mac": mac,
+              "temp_unitid": 2 if units == "F" else 1}
+    fmt = lambda t: (t + offset).strftime("%Y-%m-%d %H:%M:%S")  # station-local time
+    r = requests.get(f"{base}/history", params={**common, "start_date": fmt(start_utc), "end_date": fmt(end_utc),
+                                                 "cycle_type": "5min", "call_back": "outdoor.temperature"},
+                     timeout=20)
+    r.raise_for_status()
+    body = r.json()
+    if body.get("code") != 0:
+        raise ValueError(f"Ecowitt: {body.get('msg', 'error')}")
+    series = (((body.get("data") or {}).get("outdoor") or {}).get("temperature") or {}).get("list") or {}
+    temps = [float(v) for ts, v in series.items()
+             if v not in (None, "", "-") and start_utc <= datetime.fromtimestamp(int(ts), timezone.utc) <= end_utc]
+    now = None
+    r = requests.get(f"{base}/real_time", params={**common, "call_back": "outdoor"}, timeout=15)
+    if r.ok and r.json().get("code") == 0:
+        val = ((((r.json().get("data") or {}).get("outdoor") or {}).get("temperature")) or {}).get("value")
+        now = float(val) if val not in (None, "") else None
+    return {"now": now, "temps": temps, "label": "Ecowitt"}
+
+
+def pws_readings(source, station, api_key, app_key, start_utc, end_utc, offset, units):
+    if source == "wu":
+        return _wu_readings(station, api_key, start_utc, end_utc, offset, units)
+    if source == "ambient":
+        return _ambient_readings(station, api_key, app_key, start_utc, end_utc, units)
+    if source == "ecowitt":
+        return _ecowitt_readings(station, api_key, app_key, start_utc, end_utc, offset, units)
+    raise ValueError(f"unknown station type {source}")
+
+
+def fetch_weather(location, units, day_end="06:30", source="station", station="", api_key="", app_key=""):
     """Current temperature, today's forecast high/low, and the high/low over the 24 hours
     ending at day_end (from Open-Meteo's 15-minute data, falling back to hourly)."""
     lat, lon, name = lookup_location_cached(location)
@@ -272,6 +428,37 @@ def fetch_weather(location, units, day_end="06:30"):
             out["hi24"], out["lo24"] = max(temps), min(temps)
             break
     out["window_end"] = end.isoformat()
+    out["source24"] = "model"
+    if source == "station":
+        # Real thermometer readings from the nearest (or chosen) NWS station.
+        try:
+            sid = station.strip().upper() or nearest_nws_station(lat, lon)
+            offset = timedelta(seconds=out["utc_offset"])
+            to_utc = lambda local: (local - offset).replace(tzinfo=timezone.utc)
+            hi, lo, n = nws_high_low(sid, to_utc(start), to_utc(end), units)
+            out["hi24"], out["lo24"], out["source24"], out["readings24"] = hi, lo, sid, n
+        except Exception as e:  # outside the US, station offline... keep the model numbers
+            print(f"NWS station data unavailable, using model data: {e!r}", file=sys.stderr)
+            out["source24"] = "model (no station)"
+    elif source in PWS_SOURCES:
+        # Your own station: current temperature and the 24-hour high/low.
+        try:
+            offset = timedelta(seconds=out["utc_offset"])
+            to_utc = lambda local: (local - offset).replace(tzinfo=timezone.utc)
+            got = pws_readings(source, station.strip(), api_key.strip(), app_key.strip(),
+                               to_utc(start), to_utc(end), offset, units)
+            if got["now"] is not None:
+                out["now"], out["now_source"] = got["now"], got["label"]
+            if len(got["temps"]) >= 12:
+                out["hi24"], out["lo24"] = max(got["temps"]), min(got["temps"])
+                out["source24"], out["readings24"] = "home", len(got["temps"])
+            else:
+                out["source24"] = "model (no station)"
+                out["station_error"] = f"only {len(got['temps'])} readings in the 24 hours"
+        except Exception as e:
+            print(f"Home station data unavailable, using model data: {e!r}", file=sys.stderr)
+            out["source24"] = "model (no station)"
+            out["station_error"] = str(e)
     return out
 
 
@@ -1124,12 +1311,50 @@ class SettingsDialog(QDialog):
         row24.addStretch(1)
         form.addRow("24-hour:", row24)
 
+        self.wx24_source = QComboBox()
+        self._sources = [("station", "NWS weather station (US)"), ("model", "Weather model (worldwide)"),
+                         ("wu", "My station: Weather Underground"), ("ambient", "My station: Ambient Weather"),
+                         ("ecowitt", "My station: Ecowitt")]
+        self.wx24_source.addItems([label for _, label in self._sources])
+        codes = [code for code, _ in self._sources]
+        current = config.get("wx24_source").lower()
+        self.wx24_source.setCurrentIndex(codes.index(current) if current in codes else 0)
+        self.wx24_source.setToolTip(
+            "Where the 24-hour high/low comes from:\n"
+            "- NWS weather station: official thermometer readings (usually the nearest airport), US only.\n"
+            "- Weather model: Open-Meteo's 15-minute model data, anywhere in the world.\n"
+            "- My station: your own home weather station. It also supplies the current temperature.")
+        form.addRow("Station data:", self.wx24_source)
+
+        self.station = QLineEdit(config.get("station"))
+        self.api_key = QLineEdit(config.get("api_key"))
+        self.app_key = QLineEdit(config.get("app_key"))
+        for w in (self.api_key, self.app_key):
+            w.setEchoMode(QLineEdit.EchoMode.PasswordEchoOnEdit)  # hidden except while typing
+        self.station.textEdited.connect(lambda t: self.station.setText(t.upper()))
+        self._form = form
+        form.addRow("Station ID:", self.station)
+        form.addRow("API key:", self.api_key)
+        form.addRow("Application key:", self.app_key)
+
+        test_row = QHBoxLayout()
+        self.test_button = QPushButton("Test station")
+        self.test_button.clicked.connect(self._test_station)
+        self.key_note = QLabel()
+        self.key_note.setStyleSheet("color: #9aa4b2; font-size: 11px;")
+        self.key_note.setWordWrap(True)
+        test_row.addWidget(self.test_button)
+        test_row.addWidget(self.key_note, 1)
+        form.addRow("", test_row)
+        self.wx24_source.currentIndexChanged.connect(lambda _: self._update_enabled())
+
         from PyQt6.QtWidgets import QGridLayout
         sizes = QGridLayout()
         sizes.setHorizontalSpacing(8)
         self.sizes = {}
-        for i, (key, label) in enumerate((("font_callsign", "Callsign"), ("font_clock", "Clocks"),
-                                          ("font_weather", "Weather"), ("font_ticker", "Ticker"))):
+        for i, (key, label) in enumerate((("font_callsign", "Callsign"), ("font_ticker", "Ticker"),
+                                          ("font_clock", "Clock times"), ("font_clock_label", "Clock labels"),
+                                          ("font_weather", "Temperatures"), ("font_weather_label", "WX labels"))):
             box = QSpinBox()
             box.setRange(6, 72)
             box.setSuffix(" pt")
@@ -1142,13 +1367,9 @@ class SettingsDialog(QDialog):
         form.addRow("Text sizes:", sizes)
 
         # Weather options only matter while the weather is shown.
-        def weather_on(on):
-            for w in (self.location, self.units, self.refresh, self.show_hilo, self.show_24h,
-                      self.sizes["font_weather"]):
-                w.setEnabled(on)
-            self.day_end.setEnabled(on and self.show_24h.isChecked())
-        self.show_weather.toggled.connect(weather_on)
-        weather_on(self.show_weather.isChecked())
+        self.show_weather.toggled.connect(lambda _: self._update_enabled())
+        self.show_24h.toggled.connect(lambda _: self._update_enabled())
+        self._update_enabled()
 
         self.screens = QComboBox()
         self.screens.addItems(["One screen", "Every screen"])
@@ -1211,6 +1432,64 @@ class SettingsDialog(QDialog):
         buttons.rejected.connect(self.reject)
         layout.addWidget(buttons)
 
+    def _source(self):
+        return self._sources[self.wx24_source.currentIndex()][0]
+
+    def _update_enabled(self):
+        on = self.show_weather.isChecked()
+        for w in (self.location, self.units, self.refresh, self.show_hilo, self.show_24h,
+                  self.sizes["font_weather"], self.sizes["font_weather_label"], self.wx24_source):
+            w.setEnabled(on)
+        self.day_end.setEnabled(on and self.show_24h.isChecked())
+        src = self._source()
+        hints = {
+            "station": ("auto", "", "", "Blank = the NWS station nearest your weather location, or an ID like KGFL."),
+            "model": ("", "", "", "Model data needs no station."),
+            "wu": ("e.g. KNYWARRE12", "API key", "",
+                   "From wunderground.com > My Profile > API Keys (free for station owners). "
+                   "Davis, Acurite and others that upload to WU work this way too."),
+            "ambient": ("MAC (optional)", "API key", "Application key",
+                        "Both keys from ambientweather.net > Account > API Keys. MAC only if you have several stations."),
+            "ecowitt": ("MAC address", "API key", "Application key",
+                        "From ecowitt.net > User Profile > Private Center; the MAC is shown under your device."),
+        }[src]
+        self.station.setPlaceholderText(hints[0])
+        self.api_key.setPlaceholderText(hints[1])
+        self.app_key.setPlaceholderText(hints[2])
+        self.key_note.setText(hints[3])
+        uses_station, uses_api, uses_app = src != "model", src in PWS_SOURCES, src in ("ambient", "ecowitt")
+        for field, used in ((self.station, uses_station), (self.api_key, uses_api), (self.app_key, uses_app)):
+            self._form.setRowVisible(field, used)  # only show the fields this source needs
+            field.setEnabled(on)
+        self.test_button.setEnabled(on and src != "model")
+
+    def _test_station(self):
+        """Fetch from the chosen station right now and say what came back."""
+        src = self._source()
+        from PyQt6.QtGui import QCursor
+        QApplication.setOverrideCursor(QCursor(Qt.CursorShape.WaitCursor))
+        try:
+            w = fetch_weather(self.location.text(), "C" if self.units.currentIndex() == 1 else "F",
+                              self.day_end.time().toString("HH:mm"), src, self.station.text(),
+                              self.api_key.text(), self.app_key.text())
+        except Exception as e:
+            QApplication.restoreOverrideCursor()
+            QMessageBox.warning(self, "Test station", f"Couldn't get the weather:\n{e}")
+            return
+        QApplication.restoreOverrideCursor()
+        unit = "°C" if self.units.currentIndex() == 1 else "°F"
+        if w.get("source24", "").startswith("model"):
+            QMessageBox.warning(self, "Test station", "The station didn't answer, so the model data would be used.\n\n"
+                                f"Reason: {w.get('station_error') or 'no NWS station data for this location'}")
+            return
+        src_name = w["source24"] if src == "station" else PWS_SOURCES[src]
+        lines = [f"Connected to {src_name}."]
+        if src in PWS_SOURCES and w.get("now_source"):
+            lines.append(f"Current temperature: {round(w['now'])}{unit}")
+        lines.append(f"24-hour high/low: {round(w['hi24'])}{unit} / {round(w['lo24'])}{unit} "
+                     f"({w.get('readings24', 0)} readings)")
+        QMessageBox.information(self, "Test station", "\n".join(lines))
+
     def _check_updates(self):
         self.check_button.setEnabled(False)
         self.check_button.setText("Checking…")
@@ -1243,6 +1522,10 @@ class SettingsDialog(QDialog):
         self.config.set("show_hilo", "yes" if self.show_hilo.isChecked() else "no")
         self.config.set("show_24h", "yes" if self.show_24h.isChecked() else "no")
         self.config.set("day_end", self.day_end.time().toString("HH:mm"))
+        self.config.set("wx24_source", self._source())
+        self.config.set("station", self.station.text().strip().upper())
+        self.config.set("api_key", self.api_key.text().strip())
+        self.config.set("app_key", self.app_key.text().strip())
         for key, box in self.sizes.items():
             self.config.set(key, box.value())
         self.config.set("screens", "all" if self.screens.currentIndex() == 1 else "one")
@@ -1390,11 +1673,14 @@ class Controller(QObject):
             self.tz = QTimeZone.systemTimeZone()
         self.tz_label = self.tz.id().data().decode().split("/")[-1].replace("_", " ")
         self.weather_timer.start(max(5, _int(self.config.get("weather_refresh"), 30)) * 60000)
-        if any(old.get(k) != self._applied[k] for k in
-               ("location", "units", "show_24h", "day_end", "show_weather")) or not old:
+        if (any(old.get(k) != self._applied[k] for k in
+                ("location", "units", "show_24h", "day_end", "show_weather", "wx24_source", "station",
+                 "api_key", "app_key"))
+                or not old):
             self.get_weather()
         if old and any(old.get(k) != self._applied[k] for k in
-                       ("font_callsign", "font_clock", "font_weather", "font_ticker", "show_weather")):
+                       ("font_callsign", "font_clock", "font_weather", "font_ticker", "show_weather",
+                        "font_clock_label", "font_weather_label")):
             QTimer.singleShot(0, lambda: [b.refit() for b in self.banners.values()])
         if _yes(self._applied["solar"]) and (not old or not _yes(old.get("solar"))
                                              or old.get("location") != self._applied["location"]):
@@ -1489,10 +1775,12 @@ class Controller(QObject):
         self._fetching = True
         location, units = self.config.get("location"), self.config.get("units").upper()
         day_end = self.config.get("day_end")
+        source, station = self.config.get("wx24_source").lower(), self.config.get("station")
+        keys = self.config.get("api_key"), self.config.get("app_key")
 
         def work():
             try:
-                text = fetch_weather(location, units, day_end)
+                text = fetch_weather(location, units, day_end, source, station, *keys)
             except LocationNotFound:
                 text = ("<span style='color:#888;'>Location not found - "
                         "right-click &gt; Settings</span>")
@@ -1528,7 +1816,8 @@ class Controller(QObject):
         """Font size in points for 'callsign', 'clock', 'weather' or 'ticker' (6-72)."""
         return max(6, min(72, _int(self.config.get(f"font_{part}"), int(DEFAULTS[f"font_{part}"]))))
 
-    def weather_html(self, px):
+    def weather_html(self, lbl):
+        """lbl = font size for the small labels, e.g. '8.0pt'."""
         if self.weather_error and not self.weather:
             return self.weather_error
         w = self.weather
@@ -1540,10 +1829,19 @@ class Controller(QObject):
         if _yes(self.config.get("show_24h")):
             h, m = _parse_day_end(self.config.get("day_end"))
             ends = f"{(h % 12) or 12}:{m:02d}{'a' if h < 12 else 'p'}"
-            if w.get("hi24") is None:
-                html += f"<span style='color:#888; font-size:{px(11)};'>24h n/a</span>"
+            src = w.get("source24", "model")
+            if src == "model":
+                tag = f"24h→{ends}"                 # model chosen in Settings
+            elif src.startswith("model"):
+                tag = f"24h model→{ends}"           # wanted a station, none available
+            elif src == "home":
+                tag = f"24h home→{ends}"            # your own weather station
             else:
-                html += (f"<span style='color:#888; font-size:{px(11)};'>&nbsp;24h→{ends}</span> "
+                tag = f"24h {src}→{ends}"           # real station readings, e.g. KGFL
+            if w.get("hi24") is None:
+                html += f"<span style='color:#888; font-size:{lbl};'>24h n/a</span>"
+            else:
+                html += (f"<span style='color:#888; font-size:{lbl};'>&nbsp;{escape(tag)}</span> "
                          f"<span style='color:#ff5f5f;'>H:{round(w['hi24'])}{unit}</span> "
                          f"<span style='color:#5fafff;'>L:{round(w['lo24'])}{unit}</span>")
         return html
@@ -1911,22 +2209,24 @@ class Banner(QWidget):
             pt = c.font_pt(part)
             return lambda n: f"{max(5.0, pt * n / main):.1f}pt"
         call, clock, wx = sizer("callsign", 18), sizer("clock", 24), sizer("weather", 18)
+        clock_lbl = f"{c.font_pt('clock_label')}pt"   # "UTC" / "New York"
+        wx_lbl = f"{c.font_pt('weather_label')}pt"    # "WX" / "24h"
         weather = ""
         if _yes(c.config.get("show_weather")):
-            weather = (f"<span style='color: #67C23A; font-size: {wx(11)};'>WX</span>"
-                       f"<span style='color: white; font-size: {wx(18)};'> {c.weather_html(wx)} </span>")
+            weather = (f"<span style='color: #67C23A; font-size: {wx_lbl};'>WX</span>"
+                       f"<span style='color: white; font-size: {wx(18)};'> {c.weather_html(wx_lbl)} </span>")
         extra = ""
         if c.tz_bad:
-            extra += f"<span style='color:red; font-size:{clock(10)};'> ! BAD TIMEZONE IN SETTINGS !</span>"
+            extra += f"<span style='color:red; font-size:{clock_lbl};'> ! BAD TIMEZONE IN SETTINGS !</span>"
         if c.status_text:
-            extra += f"<span style='color:#E6A23C; font-size:{clock(11)};'> &nbsp;{c.status_text}</span>"
+            extra += f"<span style='color:#E6A23C; font-size:{clock_lbl};'> &nbsp;{c.status_text}</span>"
         self.label.setText(f"""
         <div style='white-space: nowrap; font-weight: bold;'>
             <span style='color: #E6A23C; font-size: {call(18)};'>{c.callsign}</span> &nbsp;&nbsp;
-            <span style='color: #409EFF; font-size: {clock(11)};'>UTC</span>
+            <span style='color: #409EFF; font-size: {clock_lbl};'>UTC</span>
             <span style='color: #409EFF; font-size: {clock(24)};'> {utc_dt.toString("hh:mm:ss")} </span> &nbsp;&nbsp;
             <span style='color: #888; font-size: {clock(14)};'>{local_dt.toString("yyyy-MM-dd")}</span> &nbsp;&nbsp;
-            <span style='color: #E6A23C; font-size: {clock(11)};'>{c.tz_label}</span>
+            <span style='color: #E6A23C; font-size: {clock_lbl};'>{c.tz_label}</span>
             <span style='color: #E6A23C; font-size: {clock(24)};'> {local_dt.toString("hh:mm:ss")} </span> &nbsp;&nbsp;
             {weather}
             {extra}
