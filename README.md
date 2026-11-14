@@ -80,7 +80,7 @@ The banner remembers its position and size between runs. A tray icon (an orange 
 
 ## Settings
 
-All settings can be changed from **Right-click → Settings…**:
+All settings can be changed from **Right-click → Settings…**, organized in tabs: **General** (callsign, timezone, screens, on top, dock, startup), **Weather**, **Station data**, **Propagation**, **Text sizes** and **Updates**.
 
 - **Callsign:** your amateur radio callsign.
 - **Local timezone:** start typing to search, e.g. `New_York` or `London`.

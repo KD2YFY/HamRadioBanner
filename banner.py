@@ -31,7 +31,7 @@ from PyQt6.QtWidgets import (
     QTimeEdit, QWidget,
 )
 
-__version__ = "1.6.5"  # must match the version typed when publishing a release
+__version__ = "1.6.6"  # must match the version typed when publishing a release
 APP_NAME = "HamRadioBanner"
 RELEASES_API = os.environ.get("HAMRADIOBANNER_RELEASES_API",  # override is for testing only
                               "https://api.github.com/repos/KD2YFY/HamRadioBanner/releases/latest")
@@ -1462,6 +1462,15 @@ def settings_style():
         QPushButton:hover {{ border-color: #409EFF; }}
         QPushButton:default {{ background: #409EFF; border-color: #409EFF; }}
         QToolTip {{ background: #2a2a35; color: #ffffff; border: 1px solid #4a4a5a; }}
+        QTabWidget::pane {{ border: 1px solid #3a3a4a; border-radius: 6px; top: -1px; background: #1f1f28; }}
+        QTabBar::tab {{
+            background: #22222c; color: #9aa4b2; font-size: 13px; padding: 7px 16px;
+            border: 1px solid #3a3a4a; border-bottom: none; border-top-left-radius: 6px;
+            border-top-right-radius: 6px; margin-right: 2px;
+        }}
+        QTabBar::tab:selected {{ background: #1f1f28; color: #ffffff; border-bottom: 2px solid #E6A23C; }}
+        QTabBar::tab:hover {{ color: #ffffff; }}
+        QTabWidget > QWidget > QWidget {{ background: #1f1f28; }}
     """
 
 
@@ -1472,7 +1481,7 @@ class SettingsDialog(QDialog):
         self.setWindowTitle("Ham Radio Banner - Settings")
         self.setWindowFlag(Qt.WindowType.WindowStaysOnTopHint)
         self.setStyleSheet(settings_style())
-        self.setMinimumWidth(440)
+        self.setMinimumWidth(640)
         self.config = config
         layout = QVBoxLayout(self)
 
@@ -1482,13 +1491,42 @@ class SettingsDialog(QDialog):
             intro.setWordWrap(True)
             layout.addWidget(intro)
 
-        form = QFormLayout()
-        layout.addLayout(form)
+        # Tabs keep the window a sensible height as settings grow.
+        from PyQt6.QtWidgets import QTabWidget
+        self.tabs = QTabWidget()
+        layout.addWidget(self.tabs)
+
+        def tab(title, note=None):
+            page = QWidget()
+            outer = QVBoxLayout(page)
+            outer.setContentsMargins(16, 16, 16, 12)
+            if note:
+                hint = QLabel(note)
+                hint.setWordWrap(True)
+                hint.setStyleSheet("color: #9aa4b2; font-size: 11px; margin-bottom: 6px;")
+                outer.addWidget(hint)
+            f = QFormLayout()
+            f.setHorizontalSpacing(14)
+            f.setVerticalSpacing(10)
+            f.setFieldGrowthPolicy(QFormLayout.FieldGrowthPolicy.AllNonFixedFieldsGrow)
+            outer.addLayout(f)
+            outer.addStretch(1)
+            self.tabs.addTab(page, title)
+            return f
+
+        general = tab("General")
+        weather = tab("Weather")
+        stations = tab("Station data", "Where the 24-hour high/low (and optionally the current temperature) "
+                                       "comes from. NWS needs no account.")
+        prop = tab("Propagation")
+        sizes_form = tab("Text sizes", "Font sizes in points, like in a document (6-72). "
+                                       "The banner resizes to fit.")
+        updates = tab("Updates")
 
         self.callsign = QLineEdit(config.get("callsign") if not first_run else "")
         self.callsign.setPlaceholderText("e.g. N0CALL")
         self.callsign.textEdited.connect(lambda t: self.callsign.setText(t.upper()))
-        form.addRow("Callsign:", self.callsign)
+        general.addRow("Callsign:", self.callsign)
 
         self.timezone = QComboBox()
         self.timezone.setEditable(True)
@@ -1497,38 +1535,38 @@ class SettingsDialog(QDialog):
         self.timezone.completer().setFilterMode(Qt.MatchFlag.MatchContains)
         self.timezone.completer().setCompletionMode(QCompleter.CompletionMode.PopupCompletion)
         self.timezone.setCurrentText(config.get("timezone") or QTimeZone.systemTimeZoneId().data().decode())
-        form.addRow("Local timezone:", self.timezone)
+        general.addRow("Local timezone:", self.timezone)
 
         self.show_weather = QCheckBox("Show weather")
         self.show_weather.setChecked(_yes(config.get("show_weather")))
         self.show_weather.setToolTip("Untick to hide the weather completely; it is then not downloaded at all.")
-        form.addRow("Weather:", self.show_weather)
+        weather.addRow("Weather:", self.show_weather)
 
         self.location = QLineEdit(config.get("location"))
         self.location.setPlaceholderText("Blank = detect automatically")
         self.location.setToolTip("Leave blank to guess from your internet connection,\n"
                                  "or enter a place like 'Albany, NY', a ZIP/postal code,\n"
                                  "or coordinates like '42.65, -73.75'.")
-        form.addRow("Weather location:", self.location)
+        weather.addRow("Weather location:", self.location)
 
         self.units = QComboBox()
         self.units.addItems(["°F", "°C"])
         self.units.setCurrentIndex(1 if config.get("units").upper() == "C" else 0)
-        form.addRow("Temperature:", self.units)
+        weather.addRow("Temperature:", self.units)
 
         self.refresh = QSpinBox()
         self.refresh.setRange(5, 240)
         self.refresh.setSuffix(" min")
         self.refresh.setValue(_int(config.get("weather_refresh"), 30))
-        form.addRow("Weather refresh:", self.refresh)
+        weather.addRow("Weather refresh:", self.refresh)
 
         self.show_conditions = QCheckBox("Show current conditions (sunny, rain, snow, windy…)")
         self.show_conditions.setChecked(_yes(config.get("show_conditions")))
-        form.addRow("Conditions:", self.show_conditions)
+        weather.addRow("Conditions:", self.show_conditions)
 
         self.show_hilo = QCheckBox("Show today's forecast high/low")
         self.show_hilo.setChecked(_yes(config.get("show_hilo")))
-        form.addRow("High/low:", self.show_hilo)
+        weather.addRow("High/low:", self.show_hilo)
 
         row24 = QHBoxLayout()
         self.show_24h = QCheckBox("Show 24-hour high/low ending at")
@@ -1542,9 +1580,10 @@ class SettingsDialog(QDialog):
         self.day_end.setEnabled(self.show_24h.isChecked())
         self.show_24h.toggled.connect(self.day_end.setEnabled)
         row24.addWidget(self.show_24h)
+        row24.addSpacing(6)
         row24.addWidget(self.day_end)
         row24.addStretch(1)
-        form.addRow("24-hour:", row24)
+        weather.addRow("24-hour:", row24)
 
         self.wx24_source = QComboBox()
         self._sources = [("station", "NWS weather station (US)"), ("model", "Weather model (worldwide)"),
@@ -1561,7 +1600,7 @@ class SettingsDialog(QDialog):
             "- NWS weather station: official thermometer readings (usually the nearest airport), US only.\n"
             "- Weather model: Open-Meteo's 15-minute model data, anywhere in the world.\n"
             "- My station: your own home weather station. It also supplies the current temperature.")
-        form.addRow("Station data:", self.wx24_source)
+        stations.addRow("Source:", self.wx24_source)
 
         self.station = QLineEdit(config.get("station"))
         self.api_key = QLineEdit(config.get("api_key"))
@@ -1569,16 +1608,16 @@ class SettingsDialog(QDialog):
         for w in (self.api_key, self.app_key):
             w.setEchoMode(QLineEdit.EchoMode.PasswordEchoOnEdit)  # hidden except while typing
         self.station.textEdited.connect(lambda t: self.station.setText(t.upper()))
-        self._form = form
-        form.addRow("Station ID:", self.station)
-        form.addRow("API key:", self.api_key)
-        form.addRow("Application key:", self.app_key)
+        self._form = stations
+        stations.addRow("Station ID:", self.station)
+        stations.addRow("API key:", self.api_key)
+        stations.addRow("Application key:", self.app_key)
         self.station_current = QCheckBox("Also use the station for the current temperature")
         self.station_current.setChecked(_yes(config.get("station_current")))
         self.station_current.setToolTip("On: the current temperature (and, for NWS, the conditions) comes from the\n"
                                         "station's latest reading. Off: the station is only used for the 24-hour\n"
                                         "high/low, and the current temperature comes from the weather model.")
-        form.addRow("", self.station_current)
+        stations.addRow("", self.station_current)
 
         test_row = QHBoxLayout()
         self.test_button = QPushButton("Test station")
@@ -1589,18 +1628,22 @@ class SettingsDialog(QDialog):
         self.key_note.setOpenExternalLinks(True)  # the "Sign up" links open in the browser
 
         test_row.addWidget(self.test_button)
-        test_row.addWidget(self.key_note, 1)
-        form.addRow("", test_row)
+        test_row.addStretch(1)
+        stations.addRow("", test_row)
+        stations.addRow(self.key_note)  # sign-up instructions, full width
         self.wx24_source.currentIndexChanged.connect(lambda _: self._update_enabled())
 
         from PyQt6.QtWidgets import QGridLayout
         sizes = QGridLayout()
         sizes.setHorizontalSpacing(8)
         self.sizes = {}
-        for i, (key, label) in enumerate((("font_callsign", "Callsign"), ("font_ticker", "Ticker"),
+        sizes.setVerticalSpacing(10)
+        sizes.setColumnMinimumWidth(1, 90)
+        sizes.setColumnMinimumWidth(2, 40)
+        for i, (key, label) in enumerate((("font_callsign", "Callsign"), ("font_date", "Date"),
                                           ("font_clock", "Clock times"), ("font_clock_label", "Clock labels"),
-                                          ("font_date", "Date"), ("font_conditions", "Conditions"),
-                                          ("font_weather", "Temperatures"), ("font_weather_label", "WX labels"))):
+                                          ("font_weather", "Temperatures"), ("font_weather_label", "WX labels"),
+                                          ("font_conditions", "Conditions"), ("font_ticker", "Ticker"))):
             box = QSpinBox()
             box.setRange(6, 72)
             box.setSuffix(" pt")
@@ -1608,9 +1651,10 @@ class SettingsDialog(QDialog):
             box.setToolTip(f"Font size of the {label.lower()} text in points, like in a document.\n"
                            "Type a number or use the arrow keys.")
             self.sizes[key] = box
-            sizes.addWidget(QLabel(label), i // 2, (i % 2) * 2)
-            sizes.addWidget(box, i // 2, (i % 2) * 2 + 1)
-        form.addRow("Text sizes:", sizes)
+            sizes.addWidget(QLabel(label + ":"), i // 2, (i % 2) * 3)
+            sizes.addWidget(box, i // 2, (i % 2) * 3 + 1)
+        sizes.setColumnStretch(5, 1)
+        sizes_form.addRow(sizes)
 
         # Weather options only matter while the weather is shown.
         self.show_weather.toggled.connect(lambda _: self._update_enabled())
@@ -1622,20 +1666,20 @@ class SettingsDialog(QDialog):
         self.screens.setCurrentIndex(1 if config.get("screens").lower() == "all" else 0)
         self.screens.setToolTip("Every screen = a separate banner on each monitor.\n"
                                 "Drag each one where you want it; positions are remembered.")
-        form.addRow("Show on:", self.screens)
+        general.addRow("Show on:", self.screens)
 
         self.auto_update = QCheckBox("Install updates automatically")
         self.auto_update.setChecked(_yes(config.get("auto_update")))
         if self_update_mode() is None:
             self.auto_update.setEnabled(False)
             self.auto_update.setToolTip("This copy can't update itself (installed with pipx or git).")
-        form.addRow("Updates:", self.auto_update)
+        updates.addRow("Automatic:", self.auto_update)
 
         self.solar = QCheckBox("Show solar && band conditions ticker")
         self.solar.setChecked(_yes(config.get("solar")))
         self.solar.setToolTip("A scrolling line with SFI, A/K index, X-ray, solar wind and\n"
                               "HF/VHF band conditions from N0NBH (hamqsl.com).")
-        form.addRow("Propagation:", self.solar)
+        prop.addRow("Propagation:", self.solar)
 
         self.ticker_speed = QComboBox()
         self.ticker_speed.addItems(["Slow", "Normal", "Fast"])
@@ -1643,12 +1687,12 @@ class SettingsDialog(QDialog):
                                          if config.get("ticker_speed").lower() in Ticker.SPEEDS else "Normal")
         self.solar.toggled.connect(self.ticker_speed.setEnabled)
         self.ticker_speed.setEnabled(self.solar.isChecked())
-        form.addRow("Ticker speed:", self.ticker_speed)
+        prop.addRow("Ticker speed:", self.ticker_speed)
 
         self.on_top = QCheckBox("Always on top of other windows")
         self.on_top.setChecked(_yes(config.get("on_top")))
         self.on_top.setToolTip("When off, the banner acts like a normal window and gets a taskbar button.")
-        form.addRow("Window:", self.on_top)
+        general.addRow("Window:", self.on_top)
 
         self.dock = QCheckBox("Dock to top of screen (other windows stay below it)")
         self.dock.setChecked(_yes(config.get("dock")))
@@ -1657,11 +1701,11 @@ class SettingsDialog(QDialog):
         self.dock.toggled.connect(lambda on: (self.on_top.setChecked(True) if on else None,
                                               self.on_top.setEnabled(not on)))
         self.on_top.setEnabled(not self.dock.isChecked())
-        form.addRow("", self.dock)
+        general.addRow("", self.dock)
 
         self.autostart = QCheckBox("Start when the computer starts")
         self.autostart.setChecked(True if first_run else autostart_enabled())
-        form.addRow("Startup:", self.autostart)
+        general.addRow("Startup:", self.autostart)
 
         tools = QHBoxLayout()
         self.check_button = QPushButton("Check for updates now")
@@ -1671,7 +1715,9 @@ class SettingsDialog(QDialog):
         shortcut.clicked.connect(self._make_shortcut)
         tools.addWidget(self.check_button)
         tools.addWidget(shortcut)
-        form.addRow(f"Version {__version__}:", tools)
+        tools.addStretch(1)
+        updates.insertRow(0, "Version:", QLabel(f"<b>{__version__}</b>"))
+        updates.addRow("", tools)
 
         buttons = QDialogButtonBox(QDialogButtonBox.StandardButton.Save | QDialogButtonBox.StandardButton.Cancel)
         buttons.accepted.connect(self.accept)
