@@ -94,7 +94,7 @@ jobs:
       - name: Install the libraries Qt needs (they get bundled into the app)
         run: |
           apt-get update
-          apt-get install -y --no-install-recommends python3 python3-venv python3-pip ca-certificates \
+          apt-get install -y --no-install-recommends python3 python3-venv python3-pip libpython3.10 ca-certificates \
             zip binutils libegl1 libgl1 libglib2.0-0 \
             libxkbcommon0 libxkbcommon-x11-0 libfontconfig1 libfreetype6 libdbus-1-3 \
             libxcb1 libxcb-cursor0 libxcb-icccm4 libxcb-image0 libxcb-keysyms1 libxcb-randr0 \
