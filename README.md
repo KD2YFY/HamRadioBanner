@@ -23,6 +23,18 @@ No downloads on the Releases page yet? Use Option B for now.
 > **Windows:** if SmartScreen says "Windows protected your PC", click **More info → Run anyway**.
 > **Mac:** the first time, right-click the app, choose **Open**, then click **Open** again.
 
+### Linux: one-line install
+
+Open a terminal and paste:
+
+```bash
+curl -fsSL https://raw.githubusercontent.com/KD2YFY/HamRadioBanner/main/install-linux.sh | bash
+```
+
+This downloads the latest version into `~/.local/share/HamRadioBanner` and installs the one small system library it needs (it may ask for your password). Then it starts the banner, which adds a desktop shortcut and an applications-menu entry. Run the same command again any time to reinstall; your settings are kept. It works on Ubuntu, Debian, Mint, Fedora and Arch on 64-bit PCs. On a Raspberry Pi, use Option C.
+
+On Wayland desktops (the default on newer Ubuntu and Fedora), the banner runs through XWayland so that it can stay on top, remember its position and dock.
+
 ### Option B: Double-click launcher (needs Python 3.9+)
 
 1. Install Python from [python.org](https://www.python.org/downloads/). On Windows, tick **"Add python.exe to PATH"** during install.
@@ -75,9 +87,10 @@ All settings can be changed from **Right-click → Settings…**:
 - **Weather location:** leave blank to detect it automatically. You can also enter a town and state such as `Warrensburg NY` or `Albany, NY`, a ZIP code such as `12885`, a place such as `London, United Kingdom`, or coordinates such as `42.65, -73.75`. Include the state, since many towns share a name.
 - **Temperature:** °F or °C.
 - **Weather refresh:** how often to update, in minutes.
+- **Weather:** untick **Show weather** to remove the weather from the banner completely. Nothing is downloaded for it while it's off.
 - **High/low:** show or hide today's forecast high and low.
 - **24-hour:** show the highest and lowest temperatures over the 24 hours ending at a set time. The default is 6:30 AM, like a daily weather observation, and you can change it. It's shown as `24h→6:30a H:52° L:29°` and rolls over to the new day at that time. The readings come from Open-Meteo's 15-minute model data for your location, not from a weather station.
-- **Text sizes:** separate sizes for the **callsign**, the **clocks** (UTC, local time and date), the **weather** and the **ticker**, from 50% to 250%. The banner resizes to fit.
+- **Text sizes:** font sizes in points, like in a document, for the **callsign** (default 14 pt), the **clocks** (18 pt; the date and labels scale with them), the **weather** (14 pt) and the **ticker** (11 pt). Any size from 6 to 72 pt works, and the banner resizes to fit.
 - **Show on:** *One screen*, or *Every screen* for a separate banner on each monitor. Drag each banner where you want it on its monitor; every position is remembered, and banners appear or disappear as you plug in or unplug monitors.
 - **Install updates automatically:** install new versions without asking. See [Updating](#updating).
 - **Show solar & band conditions ticker:** off by default. When ticked, a second line scrolls under the clock. It shows SFI, sunspots, A and K index, X-ray, solar wind, Bz, geomagnetic field and noise. It also shows HF band conditions for day and night, and a VHF outlook: Aurora Likely or Watch, Possible 6m F2, E-skip Season, or Flat/Tropo. The VHF outlook is based on NOAA's aurora model, the 30-minute Bz and the Kp forecast, plus HamQSL's sporadic-E flags. Colors run green (good), yellow (fair) and red (poor). The data refreshes hourly.

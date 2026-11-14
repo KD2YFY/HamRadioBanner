@@ -31,7 +31,7 @@ from PyQt6.QtWidgets import (
     QTimeEdit, QWidget,
 )
 
-__version__ = "1.6.0"  # must match the version typed when publishing a release
+__version__ = "1.6.1"  # must match the version typed when publishing a release
 APP_NAME = "HamRadioBanner"
 RELEASES_API = os.environ.get("HAMRADIOBANNER_RELEASES_API",  # override is for testing only
                               "https://api.github.com/repos/KD2YFY/HamRadioBanner/releases/latest")
@@ -41,10 +41,11 @@ DEFAULTS = {
     "timezone": "",           # blank = use the computer's timezone
     "weather_refresh": "30",  # minutes
     "units": "F",             # F or C
-    "size_callsign": "100",   # text sizes in percent (50-250) for each part of the banner
-    "size_clock": "100",      #   UTC & local clocks and the date
-    "size_weather": "100",
-    "size_ticker": "100",     #   solar & band-conditions ticker
+    "font_callsign": "14",    # text sizes in points (like a document), 6-72
+    "font_clock": "18",       #   UTC & local clocks (the date and labels scale with it)
+    "font_weather": "14",
+    "font_ticker": "11",      #   solar & band-conditions ticker
+    "show_weather": "yes",    # no = hide the weather completely (and don't download it)
     "show_hilo": "yes",       # yes = today's forecast high/low
     "show_24h": "no",         # yes = observed high/low for the 24 hours ending at day_end
     "day_end": "06:30",       # end of the 24-hour high/low period (local time, HH:MM)
@@ -102,6 +103,23 @@ class Config:
 
     def settings(self):
         return {k: self.get(k) for k in DEFAULTS}
+
+    def migrate(self):
+        """v1.6.0 stored text sizes as percentages; turn them into point sizes."""
+        changed = False
+        for part in ("callsign", "clock", "weather", "ticker"):
+            old = f"size_{part}"
+            if self.parser.has_option("SETTINGS", old):
+                pct = max(50, min(250, _int(self.parser.get("SETTINGS", old), 100)))
+                if not self.parser.has_option("SETTINGS", f"font_{part}"):
+                    self.set(f"font_{part}", round(int(DEFAULTS[f"font_{part}"]) * pct / 100))
+                self.parser.remove_option("SETTINGS", old)
+                changed = True
+        if changed and self.exists:
+            try:
+                self.save()
+            except OSError:
+                pass
 
     def get(self, key):
         return self.parser.get("SETTINGS", key, fallback=DEFAULTS[key]).strip()
@@ -489,9 +507,9 @@ class Ticker(QWidget):
         self.timer.start(33)
 
     def set_html(self, html, font):
-        if (html, font.pixelSize()) == self._html:
+        if (html, font.pointSize()) == self._html:
             return
-        self._html = (html, font.pixelSize())
+        self._html = (html, font.pointSize())
         self.doc.setDefaultFont(font)
         self.doc.setHtml(f"<span style='white-space:nowrap;'>{html}</span>")
         self.doc.setTextWidth(-1)
@@ -1063,6 +1081,11 @@ class SettingsDialog(QDialog):
         self.timezone.setCurrentText(config.get("timezone") or QTimeZone.systemTimeZoneId().data().decode())
         form.addRow("Local timezone:", self.timezone)
 
+        self.show_weather = QCheckBox("Show weather")
+        self.show_weather.setChecked(_yes(config.get("show_weather")))
+        self.show_weather.setToolTip("Untick to hide the weather completely; it is then not downloaded at all.")
+        form.addRow("Weather:", self.show_weather)
+
         self.location = QLineEdit(config.get("location"))
         self.location.setPlaceholderText("Blank = detect automatically")
         self.location.setToolTip("Leave blank to guess from your internet connection,\n"
@@ -1105,18 +1128,27 @@ class SettingsDialog(QDialog):
         sizes = QGridLayout()
         sizes.setHorizontalSpacing(8)
         self.sizes = {}
-        for i, (key, label) in enumerate((("size_callsign", "Callsign"), ("size_clock", "Clocks"),
-                                          ("size_weather", "Weather"), ("size_ticker", "Ticker"))):
+        for i, (key, label) in enumerate((("font_callsign", "Callsign"), ("font_clock", "Clocks"),
+                                          ("font_weather", "Weather"), ("font_ticker", "Ticker"))):
             box = QSpinBox()
-            box.setRange(50, 250)
-            box.setSingleStep(10)
-            box.setSuffix(" %")
-            box.setValue(_int(config.get(key), 100))
-            box.setToolTip(f"Size of the {label.lower()} text. Type a number or use the arrow keys.")
+            box.setRange(6, 72)
+            box.setSuffix(" pt")
+            box.setValue(_int(config.get(key), int(DEFAULTS[key])))
+            box.setToolTip(f"Font size of the {label.lower()} text in points, like in a document.\n"
+                           "Type a number or use the arrow keys.")
             self.sizes[key] = box
             sizes.addWidget(QLabel(label), i // 2, (i % 2) * 2)
             sizes.addWidget(box, i // 2, (i % 2) * 2 + 1)
         form.addRow("Text sizes:", sizes)
+
+        # Weather options only matter while the weather is shown.
+        def weather_on(on):
+            for w in (self.location, self.units, self.refresh, self.show_hilo, self.show_24h,
+                      self.sizes["font_weather"]):
+                w.setEnabled(on)
+            self.day_end.setEnabled(on and self.show_24h.isChecked())
+        self.show_weather.toggled.connect(weather_on)
+        weather_on(self.show_weather.isChecked())
 
         self.screens = QComboBox()
         self.screens.addItems(["One screen", "Every screen"])
@@ -1207,6 +1239,7 @@ class SettingsDialog(QDialog):
         self.config.set("location", self.location.text().strip())
         self.config.set("units", "C" if self.units.currentIndex() == 1 else "F")
         self.config.set("weather_refresh", self.refresh.value())
+        self.config.set("show_weather", "yes" if self.show_weather.isChecked() else "no")
         self.config.set("show_hilo", "yes" if self.show_hilo.isChecked() else "no")
         self.config.set("show_24h", "yes" if self.show_24h.isChecked() else "no")
         self.config.set("day_end", self.day_end.time().toString("HH:mm"))
@@ -1357,10 +1390,11 @@ class Controller(QObject):
             self.tz = QTimeZone.systemTimeZone()
         self.tz_label = self.tz.id().data().decode().split("/")[-1].replace("_", " ")
         self.weather_timer.start(max(5, _int(self.config.get("weather_refresh"), 30)) * 60000)
-        if any(old.get(k) != self._applied[k] for k in ("location", "units", "show_24h", "day_end")) or not old:
+        if any(old.get(k) != self._applied[k] for k in
+               ("location", "units", "show_24h", "day_end", "show_weather")) or not old:
             self.get_weather()
         if old and any(old.get(k) != self._applied[k] for k in
-                       ("size_callsign", "size_clock", "size_weather", "size_ticker")):
+                       ("font_callsign", "font_clock", "font_weather", "font_ticker", "show_weather")):
             QTimer.singleShot(0, lambda: [b.refit() for b in self.banners.values()])
         if _yes(self._applied["solar"]) and (not old or not _yes(old.get("solar"))
                                              or old.get("location") != self._applied["location"]):
@@ -1450,7 +1484,7 @@ class Controller(QObject):
 
     # --- weather (runs in background so the clock never freezes) ---
     def get_weather(self):
-        if self._fetching:
+        if self._fetching or not _yes(self.config.get("show_weather")):
             return
         self._fetching = True
         location, units = self.config.get("location"), self.config.get("units").upper()
@@ -1483,15 +1517,16 @@ class Controller(QObject):
     def _check_day_rollover(self):
         """Refresh right after the 24-hour period rolls over (e.g. at 6:30 AM)."""
         w = self.weather
-        if not w or self._fetching or not _yes(self.config.get("show_24h")):
+        if (not w or self._fetching or not _yes(self.config.get("show_24h"))
+                or not _yes(self.config.get("show_weather"))):
             return
         now_local = (datetime.now(timezone.utc) + timedelta(seconds=w.get("utc_offset", 0))).replace(tzinfo=None)
         if window_end(now_local, self.config.get("day_end")).isoformat() != w.get("window_end"):
             self.get_weather()
 
-    def text_scale(self, part):
-        """Size factor for 'callsign', 'clock', 'weather' or 'ticker' (0.5 - 2.5)."""
-        return max(50, min(250, _int(self.config.get(f"size_{part}"), 100))) / 100
+    def font_pt(self, part):
+        """Font size in points for 'callsign', 'clock', 'weather' or 'ticker' (6-72)."""
+        return max(6, min(72, _int(self.config.get(f"font_{part}"), int(DEFAULTS[f"font_{part}"]))))
 
     def weather_html(self, px):
         if self.weather_error and not self.weather:
@@ -1725,11 +1760,11 @@ class Banner(QWidget):
             self.ctl.save_geometry(self)
 
     @staticmethod
-    def ticker_font(scale=1.0):
+    def ticker_font(points=11):
         font = QFont("Consolas")
         font.setStyleHint(QFont.StyleHint.Monospace)
         font.setFamilies(["Consolas", "Menlo", "DejaVu Sans Mono", "monospace"])
-        font.setPixelSize(max(7, round(14 * scale)))
+        font.setPointSize(points)
         font.setBold(True)
         return font
 
@@ -1867,14 +1902,19 @@ class Banner(QWidget):
                 QTimer.singleShot(0, self.dock)  # the bar's height changed
         if show_solar:
             self.ticker.set_speed(c.config.get("ticker_speed").lower())
-            self.ticker.set_html(c.solar_html, self.ticker_font(c.text_scale("ticker")))
+            self.ticker.set_html(c.solar_html, self.ticker_font(c.font_pt("ticker")))
         utc_dt = QDateTime.currentDateTimeUtc()
         local_dt = QDateTime.currentDateTime().toTimeZone(c.tz)
-        # Each part follows its own Text size setting.
-        def sizer(part):
-            k = c.text_scale(part)
-            return lambda n: f"{max(6, round(n * k))}px"
-        call, clock, wx = sizer("callsign"), sizer("clock"), sizer("weather")
+        # Each part has its own font size in points. The main text of a part (callsign, the
+        # times, the temperature) is exactly that size; its small labels scale along with it.
+        def sizer(part, main):
+            pt = c.font_pt(part)
+            return lambda n: f"{max(5.0, pt * n / main):.1f}pt"
+        call, clock, wx = sizer("callsign", 18), sizer("clock", 24), sizer("weather", 18)
+        weather = ""
+        if _yes(c.config.get("show_weather")):
+            weather = (f"<span style='color: #67C23A; font-size: {wx(11)};'>WX</span>"
+                       f"<span style='color: white; font-size: {wx(18)};'> {c.weather_html(wx)} </span>")
         extra = ""
         if c.tz_bad:
             extra += f"<span style='color:red; font-size:{clock(10)};'> ! BAD TIMEZONE IN SETTINGS !</span>"
@@ -1888,8 +1928,7 @@ class Banner(QWidget):
             <span style='color: #888; font-size: {clock(14)};'>{local_dt.toString("yyyy-MM-dd")}</span> &nbsp;&nbsp;
             <span style='color: #E6A23C; font-size: {clock(11)};'>{c.tz_label}</span>
             <span style='color: #E6A23C; font-size: {clock(24)};'> {local_dt.toString("hh:mm:ss")} </span> &nbsp;&nbsp;
-            <span style='color: #67C23A; font-size: {wx(11)};'>WX</span>
-            <span style='color: white; font-size: {wx(18)};'> {c.weather_html(wx)} </span>
+            {weather}
             {extra}
         </div>
         """)
@@ -2013,6 +2052,11 @@ def make_icon():
 
 
 def main():
+    # Wayland doesn't let apps place their own windows, stay on top or dock, so on Linux
+    # prefer X11 (XWayland, present on nearly every Wayland desktop) and fall back to Wayland.
+    if sys.platform.startswith("linux") and os.environ.get("WAYLAND_DISPLAY") \
+            and not os.environ.get("QT_QPA_PLATFORM"):
+        os.environ["QT_QPA_PLATFORM"] = "xcb;wayland"
     app = QApplication(sys.argv)
     app.setApplicationName(APP_NAME)
     app.setQuitOnLastWindowClosed(False)
@@ -2034,6 +2078,7 @@ def main():
     server.listen(server_name)
 
     config = Config()
+    config.migrate()
     ctl = Controller(config, icon)
     ctl.instance_server = server
     server.newConnection.connect(lambda: (server.nextPendingConnection(), ctl.show_banners()))
