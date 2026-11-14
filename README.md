@@ -21,7 +21,11 @@ Pick **one** of these options.
 No downloads on the Releases page yet? Use Option B for now.
 
 > **Windows:** if SmartScreen says "Windows protected your PC", click **More info → Run anyway**.
-> **Mac:** the first time, right-click the app, choose **Open**, then click **Open** again.
+> **Mac (Apple Silicon: M1 and newer):** drag **HamRadioBanner** into your **Applications** folder first, since updates can't replace it while it's in Downloads. The app isn't signed with a paid Apple certificate, so macOS blocks it the first time:
+> 1. Double-click it, and when macOS says it can't be opened, click **Done**.
+> 2. Open **System Settings → Privacy & Security**, scroll down to the message about HamRadioBanner, and click **Open Anyway**.
+>
+> If macOS says the app **"is damaged and can't be opened"**, open Terminal and run `xattr -dr com.apple.quarantine /Applications/HamRadioBanner.app`, then open it again. The banner's icon appears in the menu bar at the top right.
 
 ### Linux: one-line install
 
