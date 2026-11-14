@@ -88,6 +88,7 @@ All settings can be changed from **Right-click → Settings…**:
 - **Temperature:** °F or °C.
 - **Weather refresh:** how often to update, in minutes.
 - **Weather:** untick **Show weather** to remove the weather from the banner completely. Nothing is downloaded for it while it's off.
+- **Conditions:** show the current conditions after the temperature. These are *Sunny/Clear*, *Mostly sunny*, *Partly cloudy*, *Cloudy*, *Fog*, *Drizzle*, *Rain*, *Showers*, *Freezing rain*, *Snow* and *Thunderstorm*, plus *Windy (gusts 35 mph)* when it's breezy. They come from the weather model, which works worldwide. When an NWS station supplies the current temperature, its own observed description is used instead (e.g. *Light snow*). Off by default.
 - **High/low:** show or hide today's forecast high and low.
 - **24-hour:** show the highest and lowest temperatures over the 24 hours ending at a set time. The default is 6:30 AM, like a daily weather observation, and you can change it. It rolls over to the new day at that time.
 - **Station data:** where the 24-hour high/low comes from. The banner shows the source: `24h KGFL→6:30a`, `24h home→6:30a`, or `24h model→6:30a` when it had to fall back to the model.
@@ -98,13 +99,17 @@ All settings can be changed from **Right-click → Settings…**:
     - **Ambient Weather:** an API key and an Application key from *ambientweather.net → Account → API Keys*. A MAC address is needed only if you have more than one station.
     - **Ecowitt:** your station's MAC address, plus the API key and Application key from *ecowitt.net → User Profile → Private Center*.
 
+    **Also use the station for the current temperature** (on by default) takes the current temperature from the station too: the latest NWS reading (ignored if over 2 hours old), or your own station's live reading. Untick it to use the station only for the 24-hour high/low.
+
     Your keys are saved in `config.ini` on your own computer and are only sent to your station's service.
 - **Text sizes:** font sizes in points, like in a document. Any size from 6 to 72 pt works, and the banner resizes to fit. The defaults are:
   - **Callsign:** 14 pt
-  - **Clock times:** 18 pt; the date scales with them
+  - **Clock times:** 18 pt
+  - **Date:** 10 pt
   - **Clock labels** ("UTC", "New York"): 8 pt
   - **Temperatures:** 14 pt; this covers the town name and the readings
   - **WX labels** ("WX", "24h"): 8 pt
+  - **Conditions** ("Cloudy", "Light snow"): 11 pt
   - **Ticker:** 11 pt
 - **Show on:** *One screen*, or *Every screen* for a separate banner on each monitor. Drag each banner where you want it on its monitor; every position is remembered, and banners appear or disappear as you plug in or unplug monitors.
 - **Install updates automatically:** install new versions without asking. See [Updating](#updating).
