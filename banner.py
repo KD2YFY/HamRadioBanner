@@ -24,7 +24,7 @@ from PyQt6.QtWidgets import (
     QWidget,
 )
 
-__version__ = "1.2.2"  # must match the version typed when publishing a release
+__version__ = "1.2.3"  # must match the version typed when publishing a release
 APP_NAME = "HamRadioBanner"
 RELEASES_API = os.environ.get("HAMRADIOBANNER_RELEASES_API",  # override is for testing only
                               "https://api.github.com/repos/KD2YFY/HamRadioBanner/releases/latest")
@@ -37,6 +37,7 @@ DEFAULTS = {
     "location": "",           # blank = detect from IP; or "City, State" or "lat, lon"
     "screens": "one",         # one = a single banner; all = a banner on every monitor
     "auto_update": "no",      # yes = install new versions without asking
+    "on_top": "yes",          # yes = stay above other windows; no = normal window with taskbar button
 }
 
 
@@ -550,11 +551,16 @@ class SettingsDialog(QDialog):
         form.addRow("Show on:", self.screens)
 
         self.auto_update = QCheckBox("Install updates automatically")
-        self.auto_update.setChecked(config.get("auto_update").lower() in ("yes", "true", "1", "on"))
+        self.auto_update.setChecked(_yes(config.get("auto_update")))
         if self_update_mode() is None:
             self.auto_update.setEnabled(False)
             self.auto_update.setToolTip("This copy can't update itself (installed with pipx or git).")
         form.addRow("Updates:", self.auto_update)
+
+        self.on_top = QCheckBox("Always on top of other windows")
+        self.on_top.setChecked(_yes(config.get("on_top")))
+        self.on_top.setToolTip("When off, the banner acts like a normal window and gets a taskbar button.")
+        form.addRow("Window:", self.on_top)
 
         self.autostart = QCheckBox("Start when the computer starts")
         self.autostart.setChecked(True if first_run else autostart_enabled())
@@ -579,6 +585,7 @@ class SettingsDialog(QDialog):
         self.config.set("weather_refresh", self.refresh.value())
         self.config.set("screens", "all" if self.screens.currentIndex() == 1 else "one")
         self.config.set("auto_update", "yes" if self.auto_update.isChecked() else "no")
+        self.config.set("on_top", "yes" if self.on_top.isChecked() else "no")
         if self.autostart.isChecked() != autostart_enabled():
             try:
                 set_autostart(self.autostart.isChecked())
@@ -589,6 +596,10 @@ class SettingsDialog(QDialog):
         except OSError as e:
             QMessageBox.warning(self, "Could not save", f"Could not write {self.config.path}:\n{e}")
         super().accept()
+
+
+def _yes(value):
+    return str(value).strip().lower() in ("yes", "true", "1", "on")
 
 
 def _int(value, default):
@@ -643,6 +654,11 @@ class Controller(QObject):
         self.clock_timer = QTimer(self)
         self.clock_timer.timeout.connect(self.changed)
         self.clock_timer.start(1000)
+        # Other programs (full-screen apps, other "on top" windows, waking from sleep) can
+        # push the banner down, so quietly put it back on top every couple of seconds.
+        self.on_top_timer = QTimer(self)
+        self.on_top_timer.timeout.connect(self.keep_on_top)
+        self.on_top_timer.start(2000)
         self.weather_timer = QTimer(self)
         self.weather_timer.timeout.connect(self.get_weather)
         # Check GitHub for a newer release shortly after start, then once a day.
@@ -697,6 +713,9 @@ class Controller(QObject):
             self.get_weather()
         if old.get("screens") != self._applied["screens"]:
             self.layout_banners()
+        if old and old.get("on_top") != self._applied["on_top"]:
+            for b in self.banners.values():
+                b.apply_window_mode()
         self.changed.emit()
 
     def open_settings(self, first_run=False):
@@ -730,6 +749,16 @@ class Controller(QObject):
             if b is not source:
                 b.resize(source.size())
                 self.save_geometry(b)
+
+    def on_top(self):
+        return _yes(self.config.get("on_top"))
+
+    def keep_on_top(self):
+        # Don't cover the Settings window or a message box while one is open.
+        if not self.on_top() or QApplication.activeModalWidget() or QApplication.activePopupWidget():
+            return
+        for b in self.banners.values():
+            b.raise_without_focus()
 
     def show_banners(self, *_):
         for b in self.banners.values():
@@ -803,7 +832,7 @@ class Controller(QObject):
         else:
             self.update_action.setText(f"Download update ({info['version']})…")
         self.update_action.setVisible(True)
-        auto = self.config.get("auto_update").lower() in ("yes", "true", "1", "on")
+        auto = _yes(self.config.get("auto_update"))
         if info["download"] and auto:
             self.install_update()
         else:
@@ -864,9 +893,10 @@ class Banner(QWidget):
         self.offset = QPoint()
 
         self.setWindowTitle("Ham Radio Banner")
-        self.setWindowFlags(Qt.WindowType.FramelessWindowHint | Qt.WindowType.WindowStaysOnTopHint |
-                            Qt.WindowType.Tool)
+        self.apply_window_mode(show=False)
         self.setAttribute(Qt.WidgetAttribute.WA_TranslucentBackground)
+        # macOS hides "tool" windows when you switch to another app; keep it visible.
+        self.setAttribute(Qt.WidgetAttribute.WA_MacAlwaysShowToolWindow)
         self.setToolTip("Drag to move · drag corner to resize · right-click for options")
 
         main_layout = QVBoxLayout(self)
@@ -898,6 +928,34 @@ class Banner(QWidget):
         ctl.changed.connect(self.update_display)
         self.update_display()
         self.restore_geometry()
+
+    def apply_window_mode(self, show=True):
+        """On top: stays above other windows, no taskbar button (use the tray icon).
+        Not on top: an ordinary window with a taskbar button, so it's easy to find."""
+        if self.ctl.on_top():
+            flags = (Qt.WindowType.FramelessWindowHint | Qt.WindowType.WindowStaysOnTopHint |
+                     Qt.WindowType.Tool)
+        else:
+            flags = Qt.WindowType.FramelessWindowHint | Qt.WindowType.Window
+        if flags == self.windowFlags():
+            return
+        pos = self.pos()
+        self.setWindowFlags(flags)  # this hides the window, so show it again
+        if show:
+            self.move(pos)
+            self.show()
+
+    def raise_without_focus(self):
+        if not self.isVisible():
+            return
+        if sys.platform.startswith("win"):
+            # Re-assert "topmost" without taking keyboard focus from the app you're using.
+            import ctypes
+            HWND_TOPMOST, SWP_NOSIZE, SWP_NOMOVE, SWP_NOACTIVATE = -1, 0x1, 0x2, 0x10
+            ctypes.windll.user32.SetWindowPos(int(self.winId()), HWND_TOPMOST, 0, 0, 0, 0,
+                                              SWP_NOSIZE | SWP_NOMOVE | SWP_NOACTIVATE)
+        else:
+            self.raise_()
 
     def update_display(self):
         c = self.ctl
