@@ -31,7 +31,7 @@ from PyQt6.QtWidgets import (
     QWidget,
 )
 
-__version__ = "1.4.0"  # must match the version typed when publishing a release
+__version__ = "1.5.0"  # must match the version typed when publishing a release
 APP_NAME = "HamRadioBanner"
 RELEASES_API = os.environ.get("HAMRADIOBANNER_RELEASES_API",  # override is for testing only
                               "https://api.github.com/repos/KD2YFY/HamRadioBanner/releases/latest")
@@ -46,6 +46,7 @@ DEFAULTS = {
     "auto_update": "no",      # yes = install new versions without asking
     "solar": "no",            # yes = scrolling solar/propagation ticker under the clock
     "ticker_speed": "normal", # slow, normal or fast
+    "dock": "no",             # yes = full-width bar docked at the top; other windows stay below it
     "on_top": "yes",          # yes = stay above other windows; no = normal window with taskbar button
 }
 
@@ -717,6 +718,90 @@ def refresh_autostart():
         pass
 
 
+# ---------------------------------------------------------------- docking ---
+# Docked = a full-width bar at the top of the screen that other windows can't cover:
+# Windows "app bar" (like the taskbar) or X11 "struts" (like a Linux panel).
+
+_APPBAR_CALLBACK = 0x0400 + 0x1A7  # WM_USER + n: our private message for app-bar notices
+ABN_POSCHANGED, ABN_FULLSCREENAPP = 1, 2
+
+
+def _win_appbar(message, hwnd, rect=None):
+    """Send an app-bar message (ABM_NEW=0, ABM_REMOVE=1, ABM_QUERYPOS=2, ABM_SETPOS=3)."""
+    import ctypes
+    from ctypes import wintypes
+
+    class APPBARDATA(ctypes.Structure):
+        _fields_ = [("cbSize", wintypes.DWORD), ("hWnd", wintypes.HWND),
+                    ("uCallbackMessage", wintypes.UINT), ("uEdge", wintypes.UINT),
+                    ("rc", wintypes.RECT), ("lParam", wintypes.LPARAM)]
+
+    abd = APPBARDATA()
+    abd.cbSize = ctypes.sizeof(APPBARDATA)
+    abd.hWnd = hwnd
+    abd.uCallbackMessage = _APPBAR_CALLBACK
+    abd.uEdge = 1  # ABE_TOP
+    if rect:
+        abd.rc.left, abd.rc.top, abd.rc.right, abd.rc.bottom = rect
+    shell32 = ctypes.windll.shell32
+    shell32.SHAppBarMessage.argtypes = [wintypes.DWORD, ctypes.POINTER(APPBARDATA)]
+    shell32.SHAppBarMessage.restype = ctypes.c_size_t
+    shell32.SHAppBarMessage(message, ctypes.byref(abd))
+    return abd.rc.left, abd.rc.top, abd.rc.right, abd.rc.bottom
+
+
+def _win_monitor_rect(hwnd):
+    """The full rectangle (physical pixels) of the monitor a window is on."""
+    import ctypes
+    from ctypes import wintypes
+
+    class MONITORINFO(ctypes.Structure):
+        _fields_ = [("cbSize", wintypes.DWORD), ("rcMonitor", wintypes.RECT),
+                    ("rcWork", wintypes.RECT), ("dwFlags", wintypes.DWORD)]
+
+    user32 = ctypes.windll.user32
+    user32.MonitorFromWindow.restype = wintypes.HANDLE
+    user32.MonitorFromWindow.argtypes = [wintypes.HWND, wintypes.DWORD]
+    user32.GetMonitorInfoW.argtypes = [wintypes.HANDLE, ctypes.POINTER(MONITORINFO)]
+    info = MONITORINFO()
+    info.cbSize = ctypes.sizeof(MONITORINFO)
+    user32.GetMonitorInfoW(user32.MonitorFromWindow(hwnd, 2), ctypes.byref(info))  # 2 = nearest
+    r = info.rcMonitor
+    return r.left, r.top, r.right, r.bottom
+
+
+def _x11_strut(wid, strut=None):
+    """Reserve (or with strut=None, release) space at the top of the screen on X11."""
+    import ctypes
+    import ctypes.util
+    xlib = ctypes.cdll.LoadLibrary(ctypes.util.find_library("X11") or "libX11.so.6")
+    xlib.XOpenDisplay.restype = ctypes.c_void_p
+    xlib.XOpenDisplay.argtypes = [ctypes.c_char_p]
+    xlib.XInternAtom.restype = ctypes.c_ulong
+    xlib.XInternAtom.argtypes = [ctypes.c_void_p, ctypes.c_char_p, ctypes.c_int]
+    xlib.XChangeProperty.argtypes = [ctypes.c_void_p, ctypes.c_ulong, ctypes.c_ulong, ctypes.c_ulong,
+                                     ctypes.c_int, ctypes.c_int, ctypes.c_void_p, ctypes.c_int]
+    xlib.XDeleteProperty.argtypes = [ctypes.c_void_p, ctypes.c_ulong, ctypes.c_ulong]
+    xlib.XFlush.argtypes = xlib.XCloseDisplay.argtypes = [ctypes.c_void_p]
+    dpy = xlib.XOpenDisplay(None)
+    if not dpy:
+        return
+    try:
+        partial = xlib.XInternAtom(dpy, b"_NET_WM_STRUT_PARTIAL", 0)
+        simple = xlib.XInternAtom(dpy, b"_NET_WM_STRUT", 0)
+        if strut is None:
+            xlib.XDeleteProperty(dpy, wid, partial)
+            xlib.XDeleteProperty(dpy, wid, simple)
+        else:
+            top, x0, x1 = strut
+            values = (ctypes.c_long * 12)(0, 0, top, 0, 0, 0, 0, 0, x0, x1, 0, 0)
+            xlib.XChangeProperty(dpy, wid, partial, 6, 32, 0, values, 12)   # 6 = CARDINAL
+            xlib.XChangeProperty(dpy, wid, simple, 6, 32, 0, values, 4)
+        xlib.XFlush(dpy)
+    finally:
+        xlib.XCloseDisplay(dpy)
+
+
 # ------------------------------------------------------- desktop shortcut ---
 
 SHORTCUT_NAME = "Ham Radio Banner"
@@ -985,6 +1070,15 @@ class SettingsDialog(QDialog):
         self.on_top.setToolTip("When off, the banner acts like a normal window and gets a taskbar button.")
         form.addRow("Window:", self.on_top)
 
+        self.dock = QCheckBox("Dock to top of screen (other windows stay below it)")
+        self.dock.setChecked(_yes(config.get("dock")))
+        self.dock.setToolTip("A full-width bar across the top of the screen, like a taskbar.\n"
+                             "Maximized windows fit underneath instead of covering it.")
+        self.dock.toggled.connect(lambda on: (self.on_top.setChecked(True) if on else None,
+                                              self.on_top.setEnabled(not on)))
+        self.on_top.setEnabled(not self.dock.isChecked())
+        form.addRow("", self.dock)
+
         self.autostart = QCheckBox("Start when the computer starts")
         self.autostart.setChecked(True if first_run else autostart_enabled())
         form.addRow("Startup:", self.autostart)
@@ -1035,6 +1129,7 @@ class SettingsDialog(QDialog):
         self.config.set("screens", "all" if self.screens.currentIndex() == 1 else "one")
         self.config.set("auto_update", "yes" if self.auto_update.isChecked() else "no")
         self.config.set("on_top", "yes" if self.on_top.isChecked() else "no")
+        self.config.set("dock", "yes" if self.dock.isChecked() else "no")
         self.config.set("solar", "yes" if self.solar.isChecked() else "no")
         self.config.set("ticker_speed", self.ticker_speed.currentText().lower())
         if self.autostart.isChecked() != autostart_enabled():
@@ -1137,6 +1232,7 @@ class Controller(QObject):
         app.screenAdded.connect(lambda _s: QTimer.singleShot(1000, self.layout_banners))
         app.screenRemoved.connect(lambda _s: QTimer.singleShot(1000, self.layout_banners))
         app.aboutToQuit.connect(self.save_all_geometry)
+        app.aboutToQuit.connect(lambda: [b.release_dock() for b in self.banners.values()])
 
         self.tray = None
         if QSystemTrayIcon.isSystemTrayAvailable():
@@ -1178,9 +1274,10 @@ class Controller(QObject):
             self.get_solar()
         if old.get("screens") != self._applied["screens"]:
             self.layout_banners()
-        if old and old.get("on_top") != self._applied["on_top"]:
+        if old and (old.get("on_top") != self._applied["on_top"] or old.get("dock") != self._applied["dock"]):
             for b in self.banners.values():
                 b.apply_window_mode()
+                b.apply_dock()
         self.changed.emit()
 
     def open_settings(self, first_run=False):
@@ -1198,12 +1295,15 @@ class Controller(QObject):
             wanted = {"WINDOW": None}
         for key in list(self.banners):
             if key not in wanted:
-                self.banners.pop(key).deleteLater()
+                old = self.banners.pop(key)
+                old.release_dock()
+                old.deleteLater()
         for key, screen in wanted.items():
             if key not in self.banners:
                 banner = Banner(self, key, screen)
                 self.banners[key] = banner
                 banner.show()
+                banner.apply_dock()
 
     def _forget_menu_banner(self):
         self.menu_banner = None
@@ -1213,19 +1313,23 @@ class Controller(QObject):
         if source is None:
             return
         for b in self.banners.values():
-            if b is not source:
+            if b is not source and not b.is_docked:
                 b.resize(source.size())
                 self.save_geometry(b)
 
     def on_top(self):
-        return _yes(self.config.get("on_top"))
+        return _yes(self.config.get("on_top")) or self.docked()
+
+    def docked(self):
+        return _yes(self.config.get("dock"))
 
     def keep_on_top(self):
         # Don't cover the Settings window or a message box while one is open.
         if not self.on_top() or QApplication.activeModalWidget() or QApplication.activePopupWidget():
             return
         for b in self.banners.values():
-            b.raise_without_focus()
+            if not b.fullscreen_app:  # let full-screen games/videos cover a docked bar
+                b.raise_without_focus()
 
     def show_banners(self, *_):
         for b in self.banners.values():
@@ -1233,6 +1337,8 @@ class Controller(QObject):
             b.raise_()
 
     def save_geometry(self, banner):
+        if banner.is_docked:
+            return  # keep the undocked position for when docking is turned off
         if not self.config.exists or not self.config.reload():
             return  # never overwrite hand edits or a half-saved file
         if not self.config.parser.has_section(banner.key):
@@ -1400,6 +1506,8 @@ class Controller(QObject):
 
     def _on_update_ready(self, finish):
         self.save_all_geometry()
+        for b in self.banners.values():
+            b.release_dock()  # give the reserved strip back while the new version starts
         if self.instance_server is not None:
             self.instance_server.close()  # let the new version start up as the only copy
         try:
@@ -1426,6 +1534,11 @@ class Banner(QWidget):
         super().__init__()
         self.ctl, self.key, self.screen_ = ctl, key, screen
         self.offset = QPoint()
+        self.is_docked = False
+        self._appbar = False
+        self._dock_area = None      # free screen area measured before we reserved our strip
+        self._watched_screen = None
+        self.fullscreen_app = False
 
         self.setWindowTitle("Ham Radio Banner")
         self.apply_window_mode(show=False)
@@ -1493,6 +1606,101 @@ class Banner(QWidget):
             self.move(pos)
             self.show()
 
+    # --- docking ---
+    def apply_dock(self):
+        if self.ctl.docked():
+            self.dock()
+        else:
+            self.undock()
+
+    def dock(self):
+        screen = self.screen_ or self.screen() or QApplication.primaryScreen()
+        if self._watched_screen is not screen:  # re-dock after a resolution change
+            if self._watched_screen is not None:
+                try:
+                    self._watched_screen.geometryChanged.disconnect(self._screen_changed)
+                except TypeError:
+                    pass
+            screen.geometryChanged.connect(self._screen_changed)
+            self._watched_screen = screen
+        self.sizegrip.hide()
+        if not self.is_docked:  # square corners: sits flush against the screen edge
+            self.setStyleSheet(self.styleSheet().replace("border-radius: 12px", "border-radius: 0px"))
+        self.is_docked = True
+        height = max(self.minimumSizeHint().height(), self.sizeHint().height())
+        if sys.platform.startswith("win"):
+            g = screen.geometry()
+            self.setGeometry(g.x(), g.y(), g.width(), height)  # get onto the right monitor first
+            height = self.height()  # Qt may enforce a taller minimum than requested
+            hwnd = int(self.winId())
+            if not self._appbar:
+                _win_appbar(0, hwnd)  # ABM_NEW
+                self._appbar = True
+            left, top, right, _ = _win_monitor_rect(hwnd)
+            h = round(height * screen.devicePixelRatio())
+            # Ask Windows where the bar may go (e.g. below a top taskbar), then claim it.
+            left, top, right, _ = _win_appbar(2, hwnd, (left, top, right, top + h))
+            left, top, right, bottom = _win_appbar(3, hwnd, (left, top, right, top + h))
+            import ctypes
+            ctypes.windll.user32.MoveWindow(hwnd, left, top, right - left, bottom - top, True)
+            return
+        # macOS / Linux: sit just below the menu bar or top panel.
+        if self._dock_area is None:
+            self._dock_area = screen.availableGeometry()
+        area = self._dock_area
+        self.setGeometry(area.x(), area.y(), area.width(), height)
+        height = self.height()  # Qt may enforce a taller minimum than requested
+        if QApplication.platformName() == "xcb":
+            try:
+                dpr = screen.devicePixelRatio()
+                _x11_strut(int(self.winId()), (round((area.y() + height) * dpr),
+                                               round(area.x() * dpr), round((area.right()) * dpr)))
+            except Exception as e:
+                print(f"Docking (X11) failed: {e!r}", file=sys.stderr)
+
+    def _screen_changed(self, *_):
+        if self.is_docked:
+            self.release_dock()
+            QTimer.singleShot(500, lambda: self.is_docked and self.dock())
+
+    def release_dock(self):
+        """Give the reserved screen space back (on undock, quit, update)."""
+        self._dock_area = None
+        if self._appbar:
+            try:
+                _win_appbar(1, int(self.winId()))  # ABM_REMOVE
+            except Exception:
+                pass
+            self._appbar = False
+        elif self.is_docked and QApplication.platformName() == "xcb":
+            try:
+                _x11_strut(int(self.winId()), None)
+            except Exception:
+                pass
+
+    def undock(self):
+        if not self.is_docked:
+            return
+        self.release_dock()
+        self.is_docked = False
+        self.fullscreen_app = False
+        self.setStyleSheet(self.styleSheet().replace("border-radius: 0px", "border-radius: 12px"))
+        self.sizegrip.show()
+        self.restore_geometry()
+
+    def nativeEvent(self, event_type, message):
+        if self._appbar and sys.platform.startswith("win"):
+            from ctypes import wintypes
+            msg = wintypes.MSG.from_address(int(message))
+            if msg.message == _APPBAR_CALLBACK:
+                if msg.wParam == ABN_POSCHANGED:  # taskbar moved, screen changed...
+                    QTimer.singleShot(0, self.dock)
+                elif msg.wParam == ABN_FULLSCREENAPP:
+                    self.fullscreen_app = bool(msg.lParam)
+                    if self.fullscreen_app:
+                        self.lower()
+        return False, 0
+
     def raise_without_focus(self):
         if not self.isVisible():
             return
@@ -1512,6 +1720,8 @@ class Banner(QWidget):
             self.ticker.setVisible(show_solar)
             if not show_solar:  # shrink back to one line
                 self.resize(self.width(), self.minimumSizeHint().height())
+            if self.is_docked:
+                QTimer.singleShot(0, self.dock)  # the bar's height changed
         if show_solar:
             self.ticker.set_speed(c.config.get("ticker_speed").lower())
             self.ticker.set_html(c.solar_html, self.ticker_font())
@@ -1560,7 +1770,7 @@ class Banner(QWidget):
             self.offset = event.position().toPoint()
 
     def mouseMoveEvent(self, event):
-        if event.buttons() == Qt.MouseButton.LeftButton:
+        if event.buttons() == Qt.MouseButton.LeftButton and not self.is_docked:
             self.move(self.mapToGlobal(event.position().toPoint() - self.offset))
 
     def mouseReleaseEvent(self, event):
