@@ -31,7 +31,7 @@ from PyQt6.QtWidgets import (
     QTimeEdit, QWidget,
 )
 
-__version__ = "1.6.3"  # must match the version typed when publishing a release
+__version__ = "1.6.4"  # must match the version typed when publishing a release
 APP_NAME = "HamRadioBanner"
 RELEASES_API = os.environ.get("HAMRADIOBANNER_RELEASES_API",  # override is for testing only
                               "https://api.github.com/repos/KD2YFY/HamRadioBanner/releases/latest")
@@ -1792,9 +1792,7 @@ class Controller(QObject):
             wanted = {"WINDOW": None}
         for key in list(self.banners):
             if key not in wanted:
-                old = self.banners.pop(key)
-                old.release_dock()
-                old.deleteLater()
+                self.banners.pop(key).retire()
         for key, screen in wanted.items():
             if key not in self.banners:
                 banner = Banner(self, key, screen)
@@ -2086,6 +2084,8 @@ class Banner(QWidget):
         self.offset = QPoint()
         self.is_docked = False
         self._appbar = False
+        self._appbar_hwnd = None    # the exact window Windows registered our strip for
+        self._closing = False       # set when this banner is being removed: never dock again
         self._dock_area = None      # free screen area measured before we reserved our strip
         self._watched_screen = None
         self.fullscreen_app = False
@@ -2176,7 +2176,23 @@ class Banner(QWidget):
         else:
             self.undock()
 
+    def retire(self):
+        """Remove this banner for good (e.g. switching from Every screen to One screen):
+        give back its reserved strip first, and make sure nothing can re-dock it."""
+        self._closing = True
+        self.release_dock()
+        self.is_docked = False
+        self.hide()
+        self.deleteLater()
+
+    def _redock(self):
+        """Delayed re-dock (after a resolution or taskbar change) - only if still wanted."""
+        if self.is_docked and not self._closing:
+            self.dock()
+
     def dock(self):
+        if self._closing:
+            return
         screen = self.screen_ or self.screen() or QApplication.primaryScreen()
         if self._watched_screen is not screen:  # re-dock after a resolution change
             if self._watched_screen is not None:
@@ -2196,9 +2212,13 @@ class Banner(QWidget):
             self.setGeometry(g.x(), g.y(), g.width(), height)  # get onto the right monitor first
             height = self.height()  # Qt may enforce a taller minimum than requested
             hwnd = int(self.winId())
+            if self._appbar and self._appbar_hwnd != hwnd:
+                # Qt recreated the window (e.g. a window-mode change): drop the old registration.
+                _win_appbar(1, self._appbar_hwnd)  # ABM_REMOVE
+                self._appbar = False
             if not self._appbar:
                 _win_appbar(0, hwnd)  # ABM_NEW
-                self._appbar = True
+                self._appbar, self._appbar_hwnd = True, hwnd
             left, top, right, _ = _win_monitor_rect(hwnd)
             h = round(height * screen.devicePixelRatio())
             # Ask Windows where the bar may go (e.g. below a top taskbar), then claim it.
@@ -2224,17 +2244,17 @@ class Banner(QWidget):
     def _screen_changed(self, *_):
         if self.is_docked:
             self.release_dock()
-            QTimer.singleShot(500, lambda: self.is_docked and self.dock())
+            QTimer.singleShot(500, self._redock)
 
     def release_dock(self):
         """Give the reserved screen space back (on undock, quit, update)."""
         self._dock_area = None
         if self._appbar:
             try:
-                _win_appbar(1, int(self.winId()))  # ABM_REMOVE
+                _win_appbar(1, self._appbar_hwnd)  # ABM_REMOVE, for the window that registered
             except Exception:
                 pass
-            self._appbar = False
+            self._appbar, self._appbar_hwnd = False, None
         elif self.is_docked and QApplication.platformName() == "xcb":
             try:
                 _x11_strut(int(self.winId()), None)
@@ -2256,13 +2276,23 @@ class Banner(QWidget):
             from ctypes import wintypes
             msg = wintypes.MSG.from_address(int(message))
             if msg.message == _APPBAR_CALLBACK:
-                if msg.wParam == ABN_POSCHANGED:  # taskbar moved, screen changed...
-                    QTimer.singleShot(0, self.dock)
-                elif msg.wParam == ABN_FULLSCREENAPP:
-                    self.fullscreen_app = bool(msg.lParam)
-                    if self.fullscreen_app:
-                        self.lower()
+                self._appbar_notice(msg.wParam, msg.lParam)
         return False, 0
+
+    def _appbar_notice(self, wparam, lparam):
+        """Windows tells docked bars when the layout changes or a full-screen app opens."""
+        if self._closing or not self._appbar:
+            return
+        if wparam == ABN_POSCHANGED:  # taskbar moved, another bar added/removed...
+            QTimer.singleShot(0, self._redock)
+        elif wparam == ABN_FULLSCREENAPP:
+            self.fullscreen_app = bool(lparam)
+            if self.fullscreen_app:
+                self.lower()
+
+    def closeEvent(self, event):
+        self.release_dock()  # last chance: never leave a reserved strip behind
+        super().closeEvent(event)
 
     def raise_without_focus(self):
         if not self.isVisible():
@@ -2284,7 +2314,7 @@ class Banner(QWidget):
             if not show_solar:  # shrink back to one line
                 self.resize(self.width(), self.minimumSizeHint().height())
             if self.is_docked:
-                QTimer.singleShot(0, self.dock)  # the bar's height changed
+                QTimer.singleShot(0, self._redock)  # the bar's height changed
         if show_solar:
             self.ticker.set_speed(c.config.get("ticker_speed").lower())
             self.ticker.set_html(c.solar_html, self.ticker_font(c.font_pt("ticker")))
