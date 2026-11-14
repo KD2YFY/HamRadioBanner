@@ -14,7 +14,7 @@ import math
 import re
 import time
 import xml.etree.ElementTree as ET
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 from html import escape
 
 import requests
@@ -28,10 +28,10 @@ from PyQt6.QtGui import QColor, QDesktopServices, QFont, QIcon, QPainter, QPixma
 from PyQt6.QtWidgets import (
     QApplication, QCheckBox, QComboBox, QCompleter, QDialog, QDialogButtonBox, QFormLayout,
     QHBoxLayout, QLabel, QLineEdit, QPushButton, QMenu, QMessageBox, QSizeGrip, QSpinBox, QSystemTrayIcon, QVBoxLayout,
-    QWidget,
+    QTimeEdit, QWidget,
 )
 
-__version__ = "1.5.0"  # must match the version typed when publishing a release
+__version__ = "1.6.0"  # must match the version typed when publishing a release
 APP_NAME = "HamRadioBanner"
 RELEASES_API = os.environ.get("HAMRADIOBANNER_RELEASES_API",  # override is for testing only
                               "https://api.github.com/repos/KD2YFY/HamRadioBanner/releases/latest")
@@ -41,6 +41,13 @@ DEFAULTS = {
     "timezone": "",           # blank = use the computer's timezone
     "weather_refresh": "30",  # minutes
     "units": "F",             # F or C
+    "size_callsign": "100",   # text sizes in percent (50-250) for each part of the banner
+    "size_clock": "100",      #   UTC & local clocks and the date
+    "size_weather": "100",
+    "size_ticker": "100",     #   solar & band-conditions ticker
+    "show_hilo": "yes",       # yes = today's forecast high/low
+    "show_24h": "no",         # yes = observed high/low for the 24 hours ending at day_end
+    "day_end": "06:30",       # end of the 24-hour high/low period (local time, HH:MM)
     "location": "",           # blank = detect from IP; or "City, State" or "lat, lon"
     "screens": "one",         # one = a single banner; all = a banner on every monitor
     "auto_update": "no",      # yes = install new versions without asking
@@ -191,7 +198,29 @@ def lookup_location(text):
     raise LocationNotFound(text)
 
 
-def fetch_weather(location, units):
+def _parse_day_end(text):
+    try:
+        h, m = (int(x) for x in str(text).strip().split(":"))
+        if 0 <= h < 24 and 0 <= m < 60:
+            return h, m
+    except ValueError:
+        pass
+    return 6, 30
+
+
+def window_end(now_local, day_end):
+    """End of the latest completed 24-hour period: today at day_end if that has passed,
+    otherwise yesterday at day_end."""
+    h, m = _parse_day_end(day_end)
+    end = now_local.replace(hour=h, minute=m, second=0, microsecond=0)
+    if now_local < end:
+        end -= timedelta(days=1)
+    return end
+
+
+def fetch_weather(location, units, day_end="06:30"):
+    """Current temperature, today's forecast high/low, and the high/low over the 24 hours
+    ending at day_end (from Open-Meteo's 15-minute data, falling back to hourly)."""
     lat, lon, name = lookup_location_cached(location)
     res = requests.get(
         "https://api.open-meteo.com/v1/forecast",
@@ -199,19 +228,33 @@ def fetch_weather(location, units):
             "latitude": lat, "longitude": lon,
             "current": "temperature_2m",
             "daily": "temperature_2m_max,temperature_2m_min",
+            "minutely_15": "temperature_2m",
+            "hourly": "temperature_2m",
             "temperature_unit": "celsius" if units == "C" else "fahrenheit",
-            "timezone": "auto", "forecast_days": 1,
+            "timezone": "auto", "past_days": 2, "forecast_days": 1,
         },
-        timeout=5,
+        timeout=10,
     ).json()
-    now = res["current"]["temperature_2m"]
-    hi = res["daily"]["temperature_2m_max"][0]
-    lo = res["daily"]["temperature_2m_min"][0]
-    return (f"{name} {round(now)}° "
-            f"<span style='color:#ff5f5f;'>H:{round(hi)}°</span> "
-            f"<span style='color:#5fafff;'>L:{round(lo)}°</span>")
-
-
+    now_local = datetime.fromisoformat(res["current"]["time"])
+    today = now_local.date().isoformat()
+    days = res["daily"]["time"]
+    i = days.index(today) if today in days else len(days) - 1
+    out = {
+        "name": name, "now": res["current"]["temperature_2m"],
+        "hi": res["daily"]["temperature_2m_max"][i], "lo": res["daily"]["temperature_2m_min"][i],
+        "utc_offset": res.get("utc_offset_seconds", 0), "hi24": None, "lo24": None,
+    }
+    end = window_end(now_local, day_end)
+    start = end - timedelta(hours=24)
+    for series in ("minutely_15", "hourly"):
+        data = res.get(series) or {}
+        temps = [t for when, t in zip(data.get("time", []), data.get("temperature_2m", []))
+                 if t is not None and start <= datetime.fromisoformat(when) <= end]
+        if len(temps) >= (48 if series == "minutely_15" else 20):  # enough to cover the day
+            out["hi24"], out["lo24"] = max(temps), min(temps)
+            break
+    out["window_end"] = end.isoformat()
+    return out
 
 
 # ----------------------------------------------------------------- solar ---
@@ -446,9 +489,9 @@ class Ticker(QWidget):
         self.timer.start(33)
 
     def set_html(self, html, font):
-        if html == self._html:
+        if (html, font.pixelSize()) == self._html:
             return
-        self._html = html
+        self._html = (html, font.pixelSize())
         self.doc.setDefaultFont(font)
         self.doc.setHtml(f"<span style='white-space:nowrap;'>{html}</span>")
         self.doc.setTextWidth(-1)
@@ -952,18 +995,19 @@ def settings_style():
     return f"""
         QDialog {{ background: #1b1b22; }}
         QLabel, QCheckBox {{ color: #e6e6e6; font-size: 13px; }}
-        QLineEdit, QComboBox, QSpinBox {{
+        QLineEdit, QComboBox, QSpinBox, QTimeEdit {{
             background: #2a2a35; color: #ffffff; font-size: 13px;
             border: 1px solid #4a4a5a; border-radius: 5px; padding: 5px 8px; min-height: 18px;
         }}
-        QLineEdit:focus, QComboBox:focus, QSpinBox:focus {{ border-color: #409EFF; }}
+        QLineEdit:focus, QComboBox:focus, QSpinBox:focus, QTimeEdit:focus {{ border-color: #409EFF; }}
         QComboBox::drop-down {{ border: none; width: 24px; }}
         QComboBox::down-arrow {{ image: url("{arrow}"); width: 14px; height: 14px; }}
         QComboBox QAbstractItemView {{
             background: #2a2a35; color: #ffffff; selection-background-color: #409EFF;
             border: 1px solid #4a4a5a;
         }}
-        QSpinBox::up-button, QSpinBox::down-button {{ width: 0; border: none; }}
+        QSpinBox::up-button, QSpinBox::down-button, QTimeEdit::up-button, QTimeEdit::down-button {{
+            width: 0; border: none; }}
         QCheckBox {{ spacing: 10px; padding: 3px 0; }}
         QCheckBox::indicator {{
             width: 18px; height: 18px; border: 2px solid #8a8aa0; border-radius: 4px;
@@ -1036,6 +1080,43 @@ class SettingsDialog(QDialog):
         self.refresh.setSuffix(" min")
         self.refresh.setValue(_int(config.get("weather_refresh"), 30))
         form.addRow("Weather refresh:", self.refresh)
+
+        self.show_hilo = QCheckBox("Show today's forecast high/low")
+        self.show_hilo.setChecked(_yes(config.get("show_hilo")))
+        form.addRow("High/low:", self.show_hilo)
+
+        row24 = QHBoxLayout()
+        self.show_24h = QCheckBox("Show 24-hour high/low ending at")
+        self.show_24h.setChecked(_yes(config.get("show_24h")))
+        self.show_24h.setToolTip("The highest and lowest temperature over the 24 hours ending at this time,\n"
+                                 "like a daily weather observation. It switches to the new day at this time.")
+        h, m = _parse_day_end(config.get("day_end"))
+        from PyQt6.QtCore import QTime
+        self.day_end = QTimeEdit(QTime(h, m))
+        self.day_end.setDisplayFormat("h:mm AP")
+        self.day_end.setEnabled(self.show_24h.isChecked())
+        self.show_24h.toggled.connect(self.day_end.setEnabled)
+        row24.addWidget(self.show_24h)
+        row24.addWidget(self.day_end)
+        row24.addStretch(1)
+        form.addRow("24-hour:", row24)
+
+        from PyQt6.QtWidgets import QGridLayout
+        sizes = QGridLayout()
+        sizes.setHorizontalSpacing(8)
+        self.sizes = {}
+        for i, (key, label) in enumerate((("size_callsign", "Callsign"), ("size_clock", "Clocks"),
+                                          ("size_weather", "Weather"), ("size_ticker", "Ticker"))):
+            box = QSpinBox()
+            box.setRange(50, 250)
+            box.setSingleStep(10)
+            box.setSuffix(" %")
+            box.setValue(_int(config.get(key), 100))
+            box.setToolTip(f"Size of the {label.lower()} text. Type a number or use the arrow keys.")
+            self.sizes[key] = box
+            sizes.addWidget(QLabel(label), i // 2, (i % 2) * 2)
+            sizes.addWidget(box, i // 2, (i % 2) * 2 + 1)
+        form.addRow("Text sizes:", sizes)
 
         self.screens = QComboBox()
         self.screens.addItems(["One screen", "Every screen"])
@@ -1126,6 +1207,11 @@ class SettingsDialog(QDialog):
         self.config.set("location", self.location.text().strip())
         self.config.set("units", "C" if self.units.currentIndex() == 1 else "F")
         self.config.set("weather_refresh", self.refresh.value())
+        self.config.set("show_hilo", "yes" if self.show_hilo.isChecked() else "no")
+        self.config.set("show_24h", "yes" if self.show_24h.isChecked() else "no")
+        self.config.set("day_end", self.day_end.time().toString("HH:mm"))
+        for key, box in self.sizes.items():
+            self.config.set(key, box.value())
         self.config.set("screens", "all" if self.screens.currentIndex() == 1 else "one")
         self.config.set("auto_update", "yes" if self.auto_update.isChecked() else "no")
         self.config.set("on_top", "yes" if self.on_top.isChecked() else "no")
@@ -1160,7 +1246,7 @@ def _int(value, default):
 class Controller(QObject):
     """Holds the settings, clock, weather and update state shared by every banner."""
     changed = pyqtSignal()
-    _weather_ready = pyqtSignal(str)
+    _weather_ready = pyqtSignal(object)
     _solar_ready = pyqtSignal(str)
     _update_found = pyqtSignal(dict)
     _manual_check_done = pyqtSignal(object, object)
@@ -1172,7 +1258,8 @@ class Controller(QObject):
         self.config = config
         self.icon = icon
         self.banners = {}
-        self.weather_info = "Loading WX..."
+        self.weather = None                          # data from fetch_weather()
+        self.weather_error = "Loading WX..."         # shown instead when there's no data
         self.update_info = None
         self.status_text = ""
         self._fetching = False
@@ -1203,6 +1290,9 @@ class Controller(QObject):
 
         self.clock_timer = QTimer(self)
         self.clock_timer.timeout.connect(self.changed)
+        self.rollover_timer = QTimer(self)
+        self.rollover_timer.timeout.connect(self._check_day_rollover)
+        self.rollover_timer.start(60 * 1000)
         self.clock_timer.start(1000)
         # Other programs (full-screen apps, other "on top" windows, waking from sleep) can
         # push the banner down, so quietly put it back on top every couple of seconds.
@@ -1267,8 +1357,11 @@ class Controller(QObject):
             self.tz = QTimeZone.systemTimeZone()
         self.tz_label = self.tz.id().data().decode().split("/")[-1].replace("_", " ")
         self.weather_timer.start(max(5, _int(self.config.get("weather_refresh"), 30)) * 60000)
-        if any(old.get(k) != self._applied[k] for k in ("location", "units")) or not old:
+        if any(old.get(k) != self._applied[k] for k in ("location", "units", "show_24h", "day_end")) or not old:
             self.get_weather()
+        if old and any(old.get(k) != self._applied[k] for k in
+                       ("size_callsign", "size_clock", "size_weather", "size_ticker")):
+            QTimer.singleShot(0, lambda: [b.refit() for b in self.banners.values()])
         if _yes(self._applied["solar"]) and (not old or not _yes(old.get("solar"))
                                              or old.get("location") != self._applied["location"]):
             self.get_solar()
@@ -1361,10 +1454,11 @@ class Controller(QObject):
             return
         self._fetching = True
         location, units = self.config.get("location"), self.config.get("units").upper()
+        day_end = self.config.get("day_end")
 
         def work():
             try:
-                text = fetch_weather(location, units)
+                text = fetch_weather(location, units, day_end)
             except LocationNotFound:
                 text = ("<span style='color:#888;'>Location not found - "
                         "right-click &gt; Settings</span>")
@@ -1374,14 +1468,50 @@ class Controller(QObject):
             except Exception as e:  # unexpected reply from the weather service
                 print(f"Weather error: {e!r}", file=sys.stderr)
                 text = "<span style='color:#888;'>WX Unavailable</span>"
-            self._weather_ready.emit(text)
+            self._weather_ready.emit(text)  # a dict of readings, or an error message
 
         threading.Thread(target=work, daemon=True).start()
 
-    def _on_weather(self, text):
+    def _on_weather(self, result):
         self._fetching = False
-        self.weather_info = text
+        if isinstance(result, dict):
+            self.weather, self.weather_error = result, None
+        else:
+            self.weather_error = result
         self.changed.emit()
+
+    def _check_day_rollover(self):
+        """Refresh right after the 24-hour period rolls over (e.g. at 6:30 AM)."""
+        w = self.weather
+        if not w or self._fetching or not _yes(self.config.get("show_24h")):
+            return
+        now_local = (datetime.now(timezone.utc) + timedelta(seconds=w.get("utc_offset", 0))).replace(tzinfo=None)
+        if window_end(now_local, self.config.get("day_end")).isoformat() != w.get("window_end"):
+            self.get_weather()
+
+    def text_scale(self, part):
+        """Size factor for 'callsign', 'clock', 'weather' or 'ticker' (0.5 - 2.5)."""
+        return max(50, min(250, _int(self.config.get(f"size_{part}"), 100))) / 100
+
+    def weather_html(self, px):
+        if self.weather_error and not self.weather:
+            return self.weather_error
+        w = self.weather
+        unit = "°"
+        html = f"{escape(w['name'])} {round(w['now'])}{unit} " if w["name"] else f"{round(w['now'])}{unit} "
+        if _yes(self.config.get("show_hilo")):
+            html += (f"<span style='color:#ff5f5f;'>H:{round(w['hi'])}{unit}</span> "
+                     f"<span style='color:#5fafff;'>L:{round(w['lo'])}{unit}</span> ")
+        if _yes(self.config.get("show_24h")):
+            h, m = _parse_day_end(self.config.get("day_end"))
+            ends = f"{(h % 12) or 12}:{m:02d}{'a' if h < 12 else 'p'}"
+            if w.get("hi24") is None:
+                html += f"<span style='color:#888; font-size:{px(11)};'>24h n/a</span>"
+            else:
+                html += (f"<span style='color:#888; font-size:{px(11)};'>&nbsp;24h→{ends}</span> "
+                         f"<span style='color:#ff5f5f;'>H:{round(w['hi24'])}{unit}</span> "
+                         f"<span style='color:#5fafff;'>L:{round(w['lo24'])}{unit}</span>")
+        return html
 
     def get_solar(self):
         if self._solar_fetching or not _yes(self.config.get("solar")):
@@ -1581,12 +1711,25 @@ class Banner(QWidget):
         self.update_display()
         self.restore_geometry()
 
+    def refit(self):
+        """Resize to fit the text after the text size changed."""
+        if self.is_docked:
+            self.dock()
+        else:
+            # Let Qt finish recalculating sizes from the new text before shrinking/growing.
+            from PyQt6.QtCore import QEvent
+            self.label.updateGeometry()
+            for _ in range(3):  # label -> content area -> window
+                QApplication.sendPostedEvents(None, QEvent.Type.LayoutRequest.value)
+            self.adjustSize()
+            self.ctl.save_geometry(self)
+
     @staticmethod
-    def ticker_font():
+    def ticker_font(scale=1.0):
         font = QFont("Consolas")
         font.setStyleHint(QFont.StyleHint.Monospace)
         font.setFamilies(["Consolas", "Menlo", "DejaVu Sans Mono", "monospace"])
-        font.setPixelSize(14)
+        font.setPixelSize(max(7, round(14 * scale)))
         font.setBold(True)
         return font
 
@@ -1724,24 +1867,29 @@ class Banner(QWidget):
                 QTimer.singleShot(0, self.dock)  # the bar's height changed
         if show_solar:
             self.ticker.set_speed(c.config.get("ticker_speed").lower())
-            self.ticker.set_html(c.solar_html, self.ticker_font())
+            self.ticker.set_html(c.solar_html, self.ticker_font(c.text_scale("ticker")))
         utc_dt = QDateTime.currentDateTimeUtc()
         local_dt = QDateTime.currentDateTime().toTimeZone(c.tz)
+        # Each part follows its own Text size setting.
+        def sizer(part):
+            k = c.text_scale(part)
+            return lambda n: f"{max(6, round(n * k))}px"
+        call, clock, wx = sizer("callsign"), sizer("clock"), sizer("weather")
         extra = ""
         if c.tz_bad:
-            extra += "<span style='color:red; font-size:10px;'> ! BAD TIMEZONE IN SETTINGS !</span>"
+            extra += f"<span style='color:red; font-size:{clock(10)};'> ! BAD TIMEZONE IN SETTINGS !</span>"
         if c.status_text:
-            extra += f"<span style='color:#E6A23C; font-size:11px;'> &nbsp;{c.status_text}</span>"
+            extra += f"<span style='color:#E6A23C; font-size:{clock(11)};'> &nbsp;{c.status_text}</span>"
         self.label.setText(f"""
         <div style='white-space: nowrap; font-weight: bold;'>
-            <span style='color: #E6A23C; font-size: 18px;'>{c.callsign}</span> &nbsp;&nbsp;
-            <span style='color: #409EFF; font-size: 11px;'>UTC</span>
-            <span style='color: #409EFF; font-size: 24px;'> {utc_dt.toString("hh:mm:ss")} </span> &nbsp;&nbsp;
-            <span style='color: #888; font-size: 14px;'>{local_dt.toString("yyyy-MM-dd")}</span> &nbsp;&nbsp;
-            <span style='color: #E6A23C; font-size: 11px;'>{c.tz_label}</span>
-            <span style='color: #E6A23C; font-size: 24px;'> {local_dt.toString("hh:mm:ss")} </span> &nbsp;&nbsp;
-            <span style='color: #67C23A; font-size: 11px;'>WX</span>
-            <span style='color: white; font-size: 18px;'> {c.weather_info} </span>
+            <span style='color: #E6A23C; font-size: {call(18)};'>{c.callsign}</span> &nbsp;&nbsp;
+            <span style='color: #409EFF; font-size: {clock(11)};'>UTC</span>
+            <span style='color: #409EFF; font-size: {clock(24)};'> {utc_dt.toString("hh:mm:ss")} </span> &nbsp;&nbsp;
+            <span style='color: #888; font-size: {clock(14)};'>{local_dt.toString("yyyy-MM-dd")}</span> &nbsp;&nbsp;
+            <span style='color: #E6A23C; font-size: {clock(11)};'>{c.tz_label}</span>
+            <span style='color: #E6A23C; font-size: {clock(24)};'> {local_dt.toString("hh:mm:ss")} </span> &nbsp;&nbsp;
+            <span style='color: #67C23A; font-size: {wx(11)};'>WX</span>
+            <span style='color: white; font-size: {wx(18)};'> {c.weather_html(wx)} </span>
             {extra}
         </div>
         """)
