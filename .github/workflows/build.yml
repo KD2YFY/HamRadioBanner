@@ -46,8 +46,16 @@ jobs:
             echo "::error::You asked to release $WANT but banner.py says __version__ = \"$HAVE\". Update banner.py first."
             exit 1
           fi
-      - run: pip install -r requirements.txt pyinstaller
-      - run: pyinstaller --noconfirm --windowed --onedir --name HamRadioBanner banner.py
+      - run: pip install -r requirements.txt pyinstaller pillow
+      - name: Draw the app icon
+        run: python tools/make_icons.py icons
+      - name: Build
+        shell: bash
+        run: |
+          ICON=icons/icon.png
+          [ "$RUNNER_OS" = "Windows" ] && ICON=icons/icon.ico
+          [ "$RUNNER_OS" = "macOS" ] && ICON=icons/icon.icns
+          pyinstaller --noconfirm --windowed --onedir --name HamRadioBanner --icon "$ICON" banner.py
       - name: Zip
         shell: bash
         run: |

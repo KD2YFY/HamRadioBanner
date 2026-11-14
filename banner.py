@@ -27,11 +27,11 @@ from PyQt6.QtGui import QTextDocument
 from PyQt6.QtGui import QColor, QDesktopServices, QFont, QIcon, QPainter, QPixmap
 from PyQt6.QtWidgets import (
     QApplication, QCheckBox, QComboBox, QCompleter, QDialog, QDialogButtonBox, QFormLayout,
-    QLabel, QLineEdit, QMenu, QMessageBox, QSizeGrip, QSpinBox, QSystemTrayIcon, QVBoxLayout,
+    QHBoxLayout, QLabel, QLineEdit, QPushButton, QMenu, QMessageBox, QSizeGrip, QSpinBox, QSystemTrayIcon, QVBoxLayout,
     QWidget,
 )
 
-__version__ = "1.3.0"  # must match the version typed when publishing a release
+__version__ = "1.4.0"  # must match the version typed when publishing a release
 APP_NAME = "HamRadioBanner"
 RELEASES_API = os.environ.get("HAMRADIOBANNER_RELEASES_API",  # override is for testing only
                               "https://api.github.com/repos/KD2YFY/HamRadioBanner/releases/latest")
@@ -717,6 +717,124 @@ def refresh_autostart():
         pass
 
 
+# ------------------------------------------------------- desktop shortcut ---
+
+SHORTCUT_NAME = "Ham Radio Banner"
+
+
+def _icon_file(ext):
+    """Save the app icon as a file (for shortcuts of the non-bundled program)."""
+    folder = os.path.join(QStandardPaths.writableLocation(
+        QStandardPaths.StandardLocation.GenericDataLocation), "icons")
+    os.makedirs(folder, exist_ok=True)
+    path = os.path.join(folder, f"hamradiobanner.{ext}")
+    draw_icon(256).save(path)
+    return path
+
+
+def _desktop_dir():
+    if sys.platform.startswith("linux"):
+        try:
+            out = subprocess.run(["xdg-user-dir", "DESKTOP"], capture_output=True, text=True,
+                                 timeout=5, env=_clean_env()).stdout.strip()
+            if out and os.path.isdir(out):
+                return out
+        except (OSError, subprocess.SubprocessError):
+            pass
+    return QStandardPaths.writableLocation(QStandardPaths.StandardLocation.DesktopLocation)
+
+
+def _ps_quote(text):
+    return "'" + str(text).replace("'", "''") + "'"
+
+
+def create_desktop_shortcut():
+    """Put a 'Ham Radio Banner' shortcut with the app icon on the desktop. Returns its path."""
+    cmd = launch_command()
+    if sys.platform.startswith("win"):
+        frozen = getattr(sys, "frozen", False)
+        icon = sys.executable if frozen else _icon_file("ico")
+        args = subprocess.list2cmdline(cmd[1:])
+        workdir = os.path.dirname(cmd[-1] if not frozen else sys.executable)
+        # The Desktop can be redirected (e.g. to OneDrive), so ask Windows where it is.
+        script = (
+            "$d=[Environment]::GetFolderPath('Desktop');"
+            f"$l=Join-Path $d {_ps_quote(SHORTCUT_NAME + '.lnk')};"
+            "$s=(New-Object -ComObject WScript.Shell).CreateShortcut($l);"
+            f"$s.TargetPath={_ps_quote(cmd[0])};$s.Arguments={_ps_quote(args)};"
+            f"$s.WorkingDirectory={_ps_quote(workdir)};$s.IconLocation={_ps_quote(icon + ',0')};"
+            "$s.Description='Callsign, UTC/local time, weather and propagation banner';"
+            "$s.Save();Write-Output $l")
+        out = subprocess.run(["powershell", "-NoProfile", "-ExecutionPolicy", "Bypass", "-Command", script],
+                             capture_output=True, text=True, timeout=30, env=_clean_env(),
+                             creationflags=subprocess.CREATE_NO_WINDOW)
+        if out.returncode != 0:
+            raise OSError(out.stderr.strip() or "PowerShell could not create the shortcut")
+        return out.stdout.strip()
+
+    desktop = _desktop_dir()
+    os.makedirs(desktop, exist_ok=True)
+    if sys.platform == "darwin":
+        if getattr(sys, "frozen", False):  # an alias-style link to the app shows its icon
+            link = os.path.join(desktop, SHORTCUT_NAME)
+            if os.path.islink(link):
+                os.remove(link)
+            os.symlink(_mac_app_bundle(), link)
+            return link
+        import shlex
+        link = os.path.join(desktop, SHORTCUT_NAME + ".command")
+        with open(link, "w") as f:
+            f.write("#!/bin/sh\n" + " ".join(shlex.quote(c) for c in cmd) + " >/dev/null 2>&1 &\n")
+        os.chmod(link, 0o755)
+        return link
+
+    import shlex
+    entry = ("[Desktop Entry]\nType=Application\nName=Ham Radio Banner\n"
+             "Comment=Callsign, UTC/local time, weather and propagation banner\n"
+             f"Exec={' '.join(shlex.quote(c) for c in cmd)}\nIcon={_icon_file('png')}\n"
+             "Terminal=false\nCategories=Utility;HamRadio;\n")
+    link = os.path.join(desktop, "hamradiobanner.desktop")
+    with open(link, "w", encoding="utf-8") as f:
+        f.write(entry)
+    os.chmod(link, 0o755)
+    try:  # GNOME only launches desktop files marked as trusted
+        subprocess.run(["gio", "set", link, "metadata::trusted", "true"], capture_output=True,
+                       timeout=5, env=_clean_env())
+    except (OSError, subprocess.SubprocessError):
+        pass
+    apps = os.path.join(QStandardPaths.writableLocation(
+        QStandardPaths.StandardLocation.ApplicationsLocation), "hamradiobanner.desktop")
+    try:  # also list it in the applications menu
+        os.makedirs(os.path.dirname(apps), exist_ok=True)
+        with open(apps, "w", encoding="utf-8") as f:
+            f.write(entry)
+    except OSError:
+        pass
+    return link
+
+
+def ensure_desktop_shortcut_once(config):
+    """Create the desktop shortcut automatically one time per install. If the user deletes
+    it, it is not recreated (the Settings button brings it back)."""
+    if not config.exists or not config.reload():
+        return
+    if config.parser.has_option("STATE", "desktop_shortcut"):
+        return
+    try:
+        create_desktop_shortcut()
+        result = "created"
+    except Exception as e:
+        print(f"Desktop shortcut failed: {e!r}", file=sys.stderr)
+        result = "failed"
+    if not config.parser.has_section("STATE"):
+        config.parser.add_section("STATE")
+    config.parser.set("STATE", "desktop_shortcut", result)
+    try:
+        config.save()
+    except OSError:
+        pass
+
+
 # -------------------------------------------------------------- settings ---
 
 def _ui_images():
@@ -783,8 +901,9 @@ def settings_style():
 
 
 class SettingsDialog(QDialog):
-    def __init__(self, config, parent=None, first_run=False):
+    def __init__(self, config, parent=None, first_run=False, ctl=None):
         super().__init__(parent)
+        self.ctl = ctl
         self.setWindowTitle("Ham Radio Banner - Settings")
         self.setWindowFlag(Qt.WindowType.WindowStaysOnTopHint)
         self.setStyleSheet(settings_style())
@@ -870,10 +989,36 @@ class SettingsDialog(QDialog):
         self.autostart.setChecked(True if first_run else autostart_enabled())
         form.addRow("Startup:", self.autostart)
 
+        tools = QHBoxLayout()
+        self.check_button = QPushButton("Check for updates now")
+        self.check_button.clicked.connect(self._check_updates)
+        self.check_button.setEnabled(ctl is not None)
+        shortcut = QPushButton("Create desktop shortcut")
+        shortcut.clicked.connect(self._make_shortcut)
+        tools.addWidget(self.check_button)
+        tools.addWidget(shortcut)
+        form.addRow(f"Version {__version__}:", tools)
+
         buttons = QDialogButtonBox(QDialogButtonBox.StandardButton.Save | QDialogButtonBox.StandardButton.Cancel)
         buttons.accepted.connect(self.accept)
         buttons.rejected.connect(self.reject)
         layout.addWidget(buttons)
+
+    def _check_updates(self):
+        self.check_button.setEnabled(False)
+        self.check_button.setText("Checking…")
+        self.ctl.check_update(manual=True, done=self._check_done)
+
+    def _check_done(self):
+        self.check_button.setEnabled(True)
+        self.check_button.setText("Check for updates now")
+
+    def _make_shortcut(self):
+        try:
+            path = create_desktop_shortcut()
+            QMessageBox.information(self, "Desktop shortcut", f"Added a shortcut to your desktop:\n{path}")
+        except Exception as e:
+            QMessageBox.warning(self, "Desktop shortcut", f"Could not create the shortcut:\n{e}")
 
     def accept(self):
         tz = self.timezone.currentText().strip()
@@ -923,6 +1068,7 @@ class Controller(QObject):
     _weather_ready = pyqtSignal(str)
     _solar_ready = pyqtSignal(str)
     _update_found = pyqtSignal(dict)
+    _manual_check_done = pyqtSignal(object, object)
     _update_ready = pyqtSignal(object)
     _update_failed = pyqtSignal(str)
 
@@ -942,6 +1088,7 @@ class Controller(QObject):
         self.menu = QMenu()
         self.menu.addAction("Settings…", lambda: self.open_settings())
         self.menu.addAction("Refresh Weather", self.get_weather)
+        self.menu.addAction("Check for Updates…", lambda: self.check_update(manual=True))
         self.menu_banner = None  # the banner that was right-clicked
         self.match_size_action = self.menu.addAction("Make all banners this size", self.match_size)
         self.menu.aboutToShow.connect(
@@ -955,6 +1102,7 @@ class Controller(QObject):
 
         self._weather_ready.connect(self._on_weather)
         self._update_found.connect(self._on_update_found)
+        self._manual_check_done.connect(self._on_manual_check)
         self._update_ready.connect(self._on_update_ready)
         self._update_failed.connect(self._on_update_failed)
 
@@ -1037,8 +1185,10 @@ class Controller(QObject):
 
     def open_settings(self, first_run=False):
         # No parent window: otherwise the banner's dark style leaks into the dialog.
-        if SettingsDialog(self.config, None, first_run=first_run).exec():
+        if SettingsDialog(self.config, None, first_run=first_run, ctl=self).exec():
             self.apply_settings()
+            if first_run:
+                ensure_desktop_shortcut_once(self.config)
 
     # --- banners: one, or one per monitor ---
     def layout_banners(self):
@@ -1153,17 +1303,60 @@ class Controller(QObject):
         self.changed.emit()
 
     # --- updates ---
-    def check_update(self):
+    def check_update(self, manual=False, done=None):
+        """Look for a newer release. Automatic checks are silent; a manual check (menu or
+        Settings button) always answers: up to date, offer to install, or why it failed."""
         def work():
             try:
                 found = check_for_update()
             except Exception as e:  # offline, GitHub down, rate-limited... try again tomorrow
                 print(f"Update check failed: {e}", file=sys.stderr)
+                if manual:
+                    self._manual_check_done.emit({"error": str(e)}, done)
                 return
-            if found:
+            if manual:
+                self._manual_check_done.emit({"found": found}, done)
+            elif found:
                 self._update_found.emit(found)
 
         threading.Thread(target=work, daemon=True).start()
+
+    def _on_manual_check(self, result, done):
+        if done:
+            try:
+                done()
+            except RuntimeError:  # the Settings window was closed meanwhile
+                pass
+        parent = QApplication.activeModalWidget()
+        box = lambda kind, text, buttons=QMessageBox.StandardButton.Ok: kind(
+            parent, "Check for updates", text, buttons)
+        if "error" in result:
+            box(QMessageBox.warning, "Couldn't reach GitHub to check for updates.\n"
+                                     "Check your internet connection and try again.")
+            return
+        info = result["found"]
+        if not info:
+            box(QMessageBox.information, f"You're up to date - version {__version__} is the latest.")
+            return
+        if self._updating:
+            return
+        self.update_info = info
+        self.update_action.setVisible(True)
+        self.update_action.setText(f"Install update ({info['version']}) now" if info["download"]
+                                   else f"Download update ({info['version']})…")
+        self.status_text = "⬆ Update available (right-click)"
+        self.changed.emit()
+        yes_no = QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.No
+        if info["download"]:
+            if box(QMessageBox.question, f"Version {info['version']} is available (you have {__version__}).\n\n"
+                   "Install it now? The banner will restart in a few seconds.", yes_no) \
+                    == QMessageBox.StandardButton.Yes:
+                if parent:
+                    parent.reject()  # close Settings first
+                self.install_update()
+        elif box(QMessageBox.question, f"Version {info['version']} is available (you have {__version__}).\n\n"
+                 "Open the download page?", yes_no) == QMessageBox.StandardButton.Yes:
+            QDesktopServices.openUrl(QUrl(info["page"]))
 
     def _on_update_found(self, info):
         if self._updating:
@@ -1381,19 +1574,84 @@ class Banner(QWidget):
         self.ctl.menu.exec(event.globalPos())
 
 
-def make_icon():
-    """Draw a simple tray icon so no image file needs to ship with the program."""
-    pix = QPixmap(64, 64)
-    pix.fill(Qt.GlobalColor.transparent)
-    p = QPainter(pix)
+def draw_icon(size):
+    """The app icon - an antenna tower sending radio waves - drawn in code so the same
+    picture is used for the program file, desktop shortcut, tray and windows."""
+    from PyQt6.QtCore import QPointF, QRectF
+    from PyQt6.QtGui import QImage, QLinearGradient, QPainterPath, QPen
+    img = QImage(size, size, QImage.Format.Format_ARGB32_Premultiplied)
+    img.fill(Qt.GlobalColor.transparent)
+    p = QPainter(img)
     p.setRenderHint(QPainter.RenderHint.Antialiasing)
-    p.setBrush(QColor(10, 10, 15))
-    p.setPen(QColor("#E6A23C"))
-    p.drawRoundedRect(2, 2, 60, 60, 12, 12)
-    p.setFont(QFont("Arial", 26, QFont.Weight.Bold))
-    p.drawText(pix.rect(), Qt.AlignmentFlag.AlignCenter, "HR")
+    s = float(size)
+    small = size <= 32  # fewer, thicker lines so it still reads at tray size
+
+    # Rounded dark tile
+    m = s * 0.04
+    tile = QRectF(m, m, s - 2 * m, s - 2 * m)
+    grad = QLinearGradient(0, 0, 0, s)
+    grad.setColorAt(0, QColor("#22304a"))
+    grad.setColorAt(1, QColor("#0a0d16"))
+    p.setBrush(grad)
+    p.setPen(QPen(QColor("#3a4a66"), max(1.0, s * 0.012)))
+    p.drawRoundedRect(tile, s * 0.2, s * 0.2)
+
+    def pen(color, width):
+        pn = QPen(QColor(color), max(1.2, s * width))
+        pn.setCapStyle(Qt.PenCapStyle.RoundCap)
+        pn.setJoinStyle(Qt.PenJoinStyle.RoundJoin)
+        return pn
+
+    # Radio waves (blue arcs) on both sides of the antenna tip
+    apex = QPointF(s * 0.5, s * 0.36)
+    p.setBrush(Qt.BrushStyle.NoBrush)
+    radii = (0.17, 0.29) if small else (0.13, 0.22, 0.31)
+    for i, r in enumerate(radii):
+        p.setPen(pen("#409EFF" if i < 2 else "#2f6fb3", 0.075 if small else 0.045))
+        box = QRectF(apex.x() - s * r, apex.y() - s * r, 2 * s * r, 2 * s * r)
+        p.drawArc(box, 150 * 16, 60 * 16)    # left
+        p.drawArc(box, -30 * 16, 60 * 16)    # right
+
+    # Lattice tower (amber)
+    base_y, half = s * 0.86, s * 0.17
+    left, right = QPointF(s * 0.5 - half, base_y), QPointF(s * 0.5 + half, base_y)
+    tower = QPainterPath(left)
+    tower.lineTo(apex)
+    tower.lineTo(right)
+    p.setPen(pen("#E6A23C", 0.07 if small else 0.05))
+    p.drawPath(tower)
+    if not small:
+        p.setPen(pen("#E6A23C", 0.028))
+        steps = 4
+        pts = []
+        for i in range(1, steps + 1):
+            t = i / (steps + 1)
+            y = apex.y() + (base_y - apex.y()) * t
+            w = half * t
+            pts.append((QPointF(s * 0.5 - w, y), QPointF(s * 0.5 + w, y)))
+        for (l1, r1), (l2, r2) in zip(pts, pts[1:]):
+            p.drawLine(l1, r2)
+            p.drawLine(r1, l2)
+        for l1, r1 in pts:
+            p.drawLine(l1, r1)
+        p.setPen(pen("#E6A23C", 0.05))
+        p.drawLine(QPointF(left.x() - s * 0.06, base_y), QPointF(right.x() + s * 0.06, base_y))
+
+    # Glowing tip
+    p.setPen(Qt.PenStyle.NoPen)
+    p.setBrush(QColor(230, 162, 60, 90))
+    p.drawEllipse(apex, s * 0.07, s * 0.07)
+    p.setBrush(QColor("#ffd27a"))
+    p.drawEllipse(apex, s * (0.05 if small else 0.035), s * (0.05 if small else 0.035))
     p.end()
-    return QIcon(pix)
+    return img
+
+
+def make_icon():
+    icon = QIcon()
+    for size in (16, 24, 32, 48, 64, 128, 256):
+        icon.addPixmap(QPixmap.fromImage(draw_icon(size)))
+    return icon
 
 
 def main():
@@ -1422,6 +1680,7 @@ def main():
     ctl.instance_server = server
     server.newConnection.connect(lambda: (server.nextPendingConnection(), ctl.show_banners()))
     refresh_autostart()
+    ensure_desktop_shortcut_once(config)  # existing installs get the shortcut once, too
     if not config.exists:
         QTimer.singleShot(300, lambda: ctl.open_settings(first_run=True))
     sys.exit(app.exec())

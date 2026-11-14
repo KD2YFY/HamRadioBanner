@@ -48,7 +48,7 @@ hamradiobanner
 
 ## First run
 
-On first run, a small window asks for your **callsign**. Your timezone is detected automatically, and so is your weather location. Click **Save** and you're done. From then on, the banner starts by itself whenever you turn on the computer.
+On first run, a small window asks for your **callsign**. Your timezone is detected automatically, and so is your weather location. Click **Save** and you're done. A **Ham Radio Banner** shortcut with the antenna icon is added to your desktop. From then on, the banner starts by itself whenever you turn on the computer.
 
 ## Using it
 
@@ -59,10 +59,12 @@ On first run, a small window asks for your **callsign**. Your timezone is detect
 | Match sizes (multi-screen)| Resize one banner, then **Right-click → Make all banners this size** |
 | Change settings           | **Right-click → Settings…** (or double-click the banner) |
 | Update the weather now    | **Right-click → Refresh Weather**                        |
+| Check for a new version   | **Right-click → Check for Updates…** (or the button in Settings) |
+| Get the desktop shortcut back | **Settings → Create desktop shortcut**               |
 | Quit                      | **Right-click → Quit**, or use the tray icon             |
-| Find a hidden banner      | Click the **HR** tray icon, or start the banner again; it comes to the front |
+| Find a hidden banner      | Click the tray icon (orange antenna tower), or start the banner again; it comes to the front |
 
-The banner remembers its position and size between runs. A tray icon (**HR**) also appears in your system tray or menu bar, so you can find the banner or quit it. On Windows, the icon may be hidden under the **^** arrow by the clock; drag it onto the taskbar to keep it in view.
+The banner remembers its position and size between runs. A tray icon (an orange antenna tower) also appears in your system tray or menu bar, so you can find the banner or quit it. On Windows, the icon may be hidden under the **^** arrow by the clock; drag it onto the taskbar to keep it in view.
 
 ## Settings
 
@@ -77,14 +79,14 @@ All settings can be changed from **Right-click → Settings…**:
 - **Install updates automatically:** install new versions without asking. See [Updating](#updating).
 - **Show solar & band conditions ticker:** off by default. When ticked, a second line scrolls under the clock. It shows SFI, sunspots, A and K index, X-ray, solar wind, Bz, geomagnetic field and noise. It also shows HF band conditions for day and night, and a VHF outlook: Aurora Likely or Watch, Possible 6m F2, E-skip Season, or Flat/Tropo. The VHF outlook is based on NOAA's aurora model, the 30-minute Bz and the Kp forecast, plus HamQSL's sporadic-E flags. Colors run green (good), yellow (fair) and red (poor). The data refreshes hourly.
 - **Ticker speed:** Slow, Normal or Fast.
-- **Always on top of other windows:** on by default. The banner stays above your other programs and has no taskbar button; use the **HR** tray icon to find it. Turn it off and the banner acts like a normal window with its own taskbar button.
+- **Always on top of other windows:** on by default. The banner stays above your other programs and has no taskbar button; use the tray icon to find it. Turn it off and the banner acts like a normal window with its own taskbar button.
 - **Start when the computer starts:** the banner opens by itself when you log in. This is on by default for new installs. Untick it to stop.
 
 Settings are saved to `config.ini` next to the program. You can also edit that file in a text editor; changes (such as a different operator's callsign) show up within a second, no restart needed. If you installed with pipx or use the Mac app, `config.ini` is kept in your user settings folder instead. See `config.example.ini` for the format.
 
 ## Updating
 
-The banner checks for a new version once a day. When one is out, **⬆ Update available** appears on the banner.
+The banner checks for a new version once a day. To check right away, use **Right-click → Check for Updates…** or **Check for updates now** in Settings. When one is out, **⬆ Update available** appears on the banner.
 
 - **One click:** right-click → **Install update now**. The banner downloads the new version, swaps it in and restarts itself in a few seconds. Your settings are kept.
 - **Fully automatic:** turn on **Settings → Install updates automatically**, and new versions install by themselves with no click needed.
