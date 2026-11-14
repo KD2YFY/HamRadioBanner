@@ -31,7 +31,7 @@ from PyQt6.QtWidgets import (
     QTimeEdit, QWidget,
 )
 
-__version__ = "1.6.7"  # must match the version typed when publishing a release
+__version__ = "1.6.8"  # must match the version typed when publishing a release
 APP_NAME = "HamRadioBanner"
 RELEASES_API = os.environ.get("HAMRADIOBANNER_RELEASES_API",  # override is for testing only
                               "https://api.github.com/repos/KD2YFY/HamRadioBanner/releases/latest")
@@ -1249,6 +1249,31 @@ def _win_monitor_rect(hwnd):
     return r.left, r.top, r.right, r.bottom
 
 
+def _x11_window_type(wid, types):
+    """Set _NET_WM_WINDOW_TYPE, e.g. ["_NET_WM_WINDOW_TYPE_DOCK"]. Window managers read it when a
+    window is shown, so set it while the window is hidden."""
+    import ctypes
+    import ctypes.util
+    xlib = ctypes.cdll.LoadLibrary(ctypes.util.find_library("X11") or "libX11.so.6")
+    xlib.XOpenDisplay.restype = ctypes.c_void_p
+    xlib.XOpenDisplay.argtypes = [ctypes.c_char_p]
+    xlib.XInternAtom.restype = ctypes.c_ulong
+    xlib.XInternAtom.argtypes = [ctypes.c_void_p, ctypes.c_char_p, ctypes.c_int]
+    xlib.XChangeProperty.argtypes = [ctypes.c_void_p, ctypes.c_ulong, ctypes.c_ulong, ctypes.c_ulong,
+                                     ctypes.c_int, ctypes.c_int, ctypes.c_void_p, ctypes.c_int]
+    xlib.XFlush.argtypes = xlib.XCloseDisplay.argtypes = [ctypes.c_void_p]
+    dpy = xlib.XOpenDisplay(None)
+    if not dpy:
+        return
+    try:
+        prop = xlib.XInternAtom(dpy, b"_NET_WM_WINDOW_TYPE", 0)
+        atoms = (ctypes.c_long * len(types))(*[xlib.XInternAtom(dpy, t.encode(), 0) for t in types])
+        xlib.XChangeProperty(dpy, wid, prop, 4, 32, 0, atoms, len(types))  # 4 = ATOM
+        xlib.XFlush(dpy)
+    finally:
+        xlib.XCloseDisplay(dpy)
+
+
 def _x11_strut(wid, strut=None):
     """Reserve (or with strut=None, release) space at the top of the screen on X11."""
     import ctypes
@@ -2417,6 +2442,7 @@ class Banner(QWidget):
         self._appbar = False
         self._appbar_hwnd = None    # the exact window Windows registered our strip for
         self._closing = False       # set when this banner is being removed: never dock again
+        self._x11_dock_type = False  # Linux: told the window manager "this is a panel"
         self._dock_area = None      # free screen area measured before we reserved our strip
         self._watched_screen = None
         self.fullscreen_app = False
@@ -2496,6 +2522,7 @@ class Banner(QWidget):
             return
         pos = self.pos()
         self.setWindowFlags(flags)  # this hides the window, so show it again
+        self._x11_dock_type = False  # Qt set a fresh window type for the new flags
         if show:
             self.move(pos)
             self.show()
@@ -2561,6 +2588,9 @@ class Banner(QWidget):
         # macOS / Linux: sit just below the menu bar or top panel.
         if self._dock_area is None:
             self._dock_area = screen.availableGeometry()
+        # Linux: present the docked bar as a panel. Otherwise window managers such as Cinnamon,
+        # GNOME and MATE push it out of the very strip it reserved, leaving a gap at the top.
+        self._set_x11_dock_type(True)
         area = self._dock_area
         self.setGeometry(area.x(), area.y(), area.width(), height)
         height = self.height()  # Qt may enforce a taller minimum than requested
@@ -2592,10 +2622,30 @@ class Banner(QWidget):
             except Exception:
                 pass
 
+    def _set_x11_dock_type(self, on):
+        if QApplication.platformName() != "xcb" or self._x11_dock_type == on or self._closing:
+            return
+        if on:
+            types = ["_NET_WM_WINDOW_TYPE_DOCK"]
+        elif self.windowFlags() & Qt.WindowType.Tool:
+            types = ["_NET_WM_WINDOW_TYPE_UTILITY", "_NET_WM_WINDOW_TYPE_NORMAL"]
+        else:
+            types = ["_NET_WM_WINDOW_TYPE_NORMAL"]
+        visible = self.isVisible()
+        try:
+            self.hide()  # the window manager reads the type when the window is shown again
+            _x11_window_type(int(self.winId()), types)
+            self._x11_dock_type = on
+        except Exception as e:
+            print(f"Setting the X11 window type failed: {e!r}", file=sys.stderr)
+        if visible:
+            self.show()
+
     def undock(self):
         if not self.is_docked:
             return
         self.release_dock()
+        self._set_x11_dock_type(False)
         self.is_docked = False
         self.fullscreen_app = False
         self.setStyleSheet(self.styleSheet().replace("border-radius: 0px", "border-radius: 12px"))
