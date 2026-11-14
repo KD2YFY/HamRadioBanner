@@ -31,7 +31,7 @@ Open a terminal and paste:
 curl -fsSL https://raw.githubusercontent.com/KD2YFY/HamRadioBanner/main/install-linux.sh | bash
 ```
 
-This downloads the latest version into `~/.local/share/HamRadioBanner` and installs the one small system library it needs (it may ask for your password). Then it starts the banner, which adds a desktop shortcut and an applications-menu entry. Run the same command again any time to reinstall; your settings are kept. It works on Ubuntu, Debian, Mint, Fedora and Arch on 64-bit PCs. On a Raspberry Pi, use Option C.
+This downloads the latest version into `~/.local/share/HamRadioBanner` and installs the one small system library it needs (it may ask for your password). Then it starts the banner, which adds a desktop shortcut and an applications-menu entry. Run the same command again any time to reinstall; your settings are kept. It works on 64-bit PCs with Linux Mint 21 or newer, Ubuntu 22.04 or newer, Debian 12 or newer, current Fedora, and Arch. It adds **Ham Radio Banner** to your applications menu and desktop. The program itself lives in a hidden folder, which you can see with Ctrl+H in the file manager, but you shouldn't need to go there. On a Raspberry Pi, use Option C.
 
 On Wayland desktops (the default on newer Ubuntu and Fedora), the banner runs through XWayland so that it can stay on top, remember its position and dock.
 
