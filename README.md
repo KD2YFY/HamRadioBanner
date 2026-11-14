@@ -75,6 +75,8 @@ All settings can be changed from **Right-click → Settings…**:
 - **Weather refresh:** how often to update, in minutes.
 - **Show on:** *One screen*, or *Every screen* for a separate banner on each monitor. Drag each banner where you want it on its monitor; every position is remembered, and banners appear or disappear as you plug in or unplug monitors.
 - **Install updates automatically:** install new versions without asking. See [Updating](#updating).
+- **Show solar & band conditions ticker:** off by default. When ticked, a second line scrolls under the clock. It shows SFI, sunspots, A and K index, X-ray, solar wind, Bz, geomagnetic field and noise. It also shows HF band conditions for day and night, and a VHF outlook: Aurora Likely or Watch, Possible 6m F2, E-skip Season, or Flat/Tropo. The VHF outlook is based on NOAA's aurora model, the 30-minute Bz and the Kp forecast, plus HamQSL's sporadic-E flags. Colors run green (good), yellow (fair) and red (poor). The data refreshes hourly.
+- **Ticker speed:** Slow, Normal or Fast.
 - **Always on top of other windows:** on by default. The banner stays above your other programs and has no taskbar button; use the **HR** tray icon to find it. Turn it off and the banner acts like a normal window with its own taskbar button.
 - **Start when the computer starts:** the banner opens by itself when you log in. This is on by default for new installs. Untick it to stop.
 
@@ -94,12 +96,15 @@ If the banner can't update itself, the menu shows **Download update…** instead
 ## Credits
 
 Weather from [Open-Meteo](https://open-meteo.com/). Automatic location from [ip-api.com](https://ip-api.com/).
+Solar and band conditions from N0NBH ([hamqsl.com](https://www.hamqsl.com/solar.html)), and aurora and Kp data from [NOAA SWPC](https://www.swpc.noaa.gov/), both served through [KD2YFY.net/solar](https://kd2yfy.net/solar).
 
 ---
 
 ### For the maintainer: publishing a release
 
 First change `__version__` near the top of `banner.py` to the new number (e.g. `"1.2.0"`) and commit it. The build stops with an error if that number doesn't match the version you release.
+
+To publish a test build that nobody is offered automatically, use a version with a dash, such as `v1.4.0-beta.1`. It becomes a GitHub pre-release that only people who download it by hand will get.
 
 The **Build apps** GitHub Action builds the Windows, macOS and Linux downloads and puts them on the Releases page. To publish a new version: go to the **Actions** tab, pick **Build apps**, click **Run workflow**, enter a version such as `v1.2.0`, and click the green button. Pushing a version tag does the same:
 

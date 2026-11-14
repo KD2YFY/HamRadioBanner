@@ -10,6 +10,12 @@ import sys
 import tempfile
 import threading
 import zipfile
+import math
+import re
+import time
+import xml.etree.ElementTree as ET
+from datetime import datetime, timezone
+from html import escape
 
 import requests
 from PyQt6.QtCore import (
@@ -17,14 +23,15 @@ from PyQt6.QtCore import (
     QUrl, pyqtSignal,
 )
 from PyQt6.QtNetwork import QLocalServer, QLocalSocket
+from PyQt6.QtGui import QTextDocument
 from PyQt6.QtGui import QColor, QDesktopServices, QFont, QIcon, QPainter, QPixmap
 from PyQt6.QtWidgets import (
-    QApplication, QCheckBox, QComboBox, QCompleter, QDialog, QDialogButtonBox, QFormLayout, QHBoxLayout,
+    QApplication, QCheckBox, QComboBox, QCompleter, QDialog, QDialogButtonBox, QFormLayout,
     QLabel, QLineEdit, QMenu, QMessageBox, QSizeGrip, QSpinBox, QSystemTrayIcon, QVBoxLayout,
     QWidget,
 )
 
-__version__ = "1.2.3"  # must match the version typed when publishing a release
+__version__ = "1.3.0"  # must match the version typed when publishing a release
 APP_NAME = "HamRadioBanner"
 RELEASES_API = os.environ.get("HAMRADIOBANNER_RELEASES_API",  # override is for testing only
                               "https://api.github.com/repos/KD2YFY/HamRadioBanner/releases/latest")
@@ -37,6 +44,8 @@ DEFAULTS = {
     "location": "",           # blank = detect from IP; or "City, State" or "lat, lon"
     "screens": "one",         # one = a single banner; all = a banner on every monitor
     "auto_update": "no",      # yes = install new versions without asking
+    "solar": "no",            # yes = scrolling solar/propagation ticker under the clock
+    "ticker_speed": "normal", # slow, normal or fast
     "on_top": "yes",          # yes = stay above other windows; no = normal window with taskbar button
 }
 
@@ -135,6 +144,19 @@ def _matches(result, hints):
     return all(US_STATES.get(h.upper(), h).replace("_", " ").lower() in fields for h in hints)
 
 
+_location_cache = {}
+
+
+def lookup_location_cached(text):
+    """lookup_location, remembered for an hour (weather and solar both need it)."""
+    hit = _location_cache.get(text)
+    if hit and time.time() - hit[0] < 3600:
+        return hit[1]
+    result = lookup_location(text)
+    _location_cache[text] = (time.time(), result)
+    return result
+
+
 def lookup_location(text):
     """Return (lat, lon, name). text may be blank (IP lookup), 'lat, lon', a place name
     like 'Albany, NY' / 'Warrensburg NY' / 'London, United Kingdom', or a postal code."""
@@ -169,7 +191,7 @@ def lookup_location(text):
 
 
 def fetch_weather(location, units):
-    lat, lon, name = lookup_location(location)
+    lat, lon, name = lookup_location_cached(location)
     res = requests.get(
         "https://api.open-meteo.com/v1/forecast",
         params={
@@ -191,14 +213,282 @@ def fetch_weather(location, units):
 
 
 
+# ----------------------------------------------------------------- solar ---
+
+# N0NBH's solar-terrestrial report, via KD2YFY.net's edge-cached copy (kinder to HamQSL),
+# falling back to HamQSL itself.
+SOLAR_URLS = ["https://kd2yfy.net/api/hamqsl", "https://www.hamqsl.com/solarxml.php"]
+# NOAA aurora model + 30-minute average Bz, pre-digested by KD2YFY.net (functions/api/aurora.js).
+AURORA_URL = "https://kd2yfy.net/api/aurora"
+KP_FORECAST_URL = "https://services.swpc.noaa.gov/products/noaa-planetary-k-index-forecast.json"
+_UA = {"User-Agent": f"{APP_NAME}/{__version__}"}
+GOOD, FAIR, POOR, DIM = "#67C23A", "#E6A23C", "#F56C6C", "#888888"
+
+
+def _num(text):
+    try:
+        return float(text)
+    except (TypeError, ValueError):
+        return None
+
+
+def _rated(label, value, color):
+    return (f"<span style='color:#9aa4b2;'>{label}</span> "
+            f"<span style='color:{color};'>{escape(str(value))}</span>")
+
+
+def _get_hamqsl():
+    last = None
+    for url in SOLAR_URLS:
+        try:
+            res = requests.get(url, timeout=10, headers=_UA)
+            res.raise_for_status()
+            d = ET.fromstring(res.content).find("solardata")
+            if d is not None:
+                return d
+            last = ValueError(f"no <solardata> from {url}")
+        except Exception as e:  # try the next source
+            last = e
+    raise last
+
+
+def _records(data):
+    """NOAA JSON comes either as a list of objects or as rows with a header row."""
+    if not isinstance(data, list):
+        data = [data] if data else []
+    if data and isinstance(data[0], list):
+        header = [str(h).lower() for h in data[0]]
+        return [dict(zip(header, row)) for row in data[1:]]
+    return [{str(k).lower(): v for k, v in o.items()} for o in data if isinstance(o, dict)]
+
+
+def _kp_forecast_max():
+    """Highest NOAA-predicted Kp in the next 24 hours: (kp, datetime) or None."""
+    now = time.time()
+    best = None
+    for r in _records(requests.get(KP_FORECAST_URL, timeout=10, headers=_UA).json()):
+        if r.get("observed") != "predicted":
+            continue
+        kp = _num(r.get("kp"))
+        try:
+            t = datetime.strptime(str(r.get("time_tag"))[:19].replace("T", " "),
+                                  "%Y-%m-%d %H:%M:%S").replace(tzinfo=timezone.utc)
+        except ValueError:
+            continue
+        if kp is None or not (now - 3 * 3600 <= t.timestamp() <= now + 24 * 3600):
+            continue
+        if best is None or kp > best[0]:
+            best = (kp, t)
+    return best
+
+
+def sun_elevation(when, lat, lon):
+    """Sun's elevation in degrees (same formula as KD2YFY.net/solar)."""
+    rad = math.pi / 180
+    d = when.timestamp() / 86400 - 10957.5                     # days since J2000.0
+    g = (357.529 + 0.98560028 * d) * rad                       # mean anomaly
+    q = 280.459 + 0.98564736 * d                               # mean longitude
+    L = (q + 1.915 * math.sin(g) + 0.020 * math.sin(2 * g)) * rad
+    e = (23.439 - 0.00000036 * d) * rad                        # obliquity
+    ra = math.atan2(math.cos(e) * math.sin(L), math.cos(L)) / rad
+    dec = math.asin(math.sin(e) * math.sin(L))
+    gmst = (18.697374558 + 24.06570982441908 * d) % 24
+    ha = (gmst * 15 + lon - ra) * rad
+    return math.asin(math.sin(lat * rad) * math.sin(dec) +
+                     math.cos(lat * rad) * math.cos(dec) * math.cos(ha)) / rad
+
+
+def vhf_status(k, sfi, speed, bz30, aurora_north, kp_fc, is_day, now):
+    """VHF outlook using the same rules as KD2YFY.net/solar. Returns (text, colour)."""
+    k = k if k is not None else 0
+    sfi = sfi if sfi is not None else 0
+    big = float("inf")
+    bz = bz30 if bz30 is not None else big
+    north = aurora_north if aurora_north is not None else -1
+    fc = kp_fc[0] if kp_fc else 0
+    if k >= 6 or north >= 20 or (k >= 5 and bz <= -10):
+        return "AURORA LIKELY - beam north on 6m/2m", "#c084fc"
+    if k >= 5 or north >= 5 or bz <= -8 or (bz <= -5 and (speed or 0) >= 500) or fc >= 6:
+        return "AURORA WATCH - monitor 6m/2m to the north", "#d8b4fe"
+    month = now.month
+    if (month >= 9 or month <= 4) and sfi >= 150 and is_day:
+        return "POSSIBLE 6M F2 - check 50.313 FT8", GOOD
+    if 5 <= month <= 8:
+        return "E-SKIP SEASON - watch 6m & 10m", "#fde047"
+    if (month == 12 and now.day >= 15) or (month == 1 and now.day <= 15):
+        return "FLAT / TROPO - winter Es peak, short 6m openings", DIM
+    return "FLAT / TROPO", DIM
+
+
+def fetch_solar(location=""):
+    """Download the solar/propagation report and return it as coloured ticker HTML."""
+    d = _get_hamqsl()
+    t = lambda tag: (d.findtext(tag) or "").strip()
+    sep = " <span style='color:#4a4a5a;'>│</span> "
+    parts = ["<span style='color:#E6A23C;'>☀ SOLAR</span>"]
+
+    sfi, ssn, a, k = _num(t("solarflux")), t("sunspots"), _num(t("aindex")), _num(t("kindex"))
+    if sfi is not None:
+        parts.append(_rated("SFI", int(sfi), GOOD if sfi >= 120 else FAIR if sfi >= 90 else POOR))
+    if ssn:
+        parts.append(_rated("SSN", ssn, "#ffffff"))
+    if a is not None:
+        parts.append(_rated("A", int(a), GOOD if a < 10 else FAIR if a < 30 else POOR))
+    if k is not None:
+        parts.append(_rated("K", int(k), GOOD if k <= 2 else FAIR if k <= 4 else POOR))
+    xray = t("xray")
+    if xray:
+        parts.append(_rated("X-ray", xray, GOOD if xray[:1] in "AB" else FAIR if xray[:1] == "C" else POOR))
+    wind = _num(t("solarwind"))
+    if wind is not None:
+        parts.append(_rated("Wind", f"{int(wind)} km/s", GOOD if wind < 500 else FAIR if wind < 700 else POOR))
+    bz = _num(t("magneticfield"))
+    if bz is not None:
+        parts.append(_rated("Bz", f"{bz:+.1f}", GOOD if bz > -5 else FAIR if bz > -10 else POOR))
+    geo = t("geomagfield")
+    if geo:
+        g = geo.upper()
+        parts.append(_rated("Geomag", geo.title(), POOR if "STORM" in g else FAIR if ("ACTIVE" in g or "UNSET" in g)
+                            else GOOD))
+    noise = t("signalnoise")
+    if noise:
+        parts.append(_rated("Noise", noise, "#ffffff"))
+
+    # HF band conditions, day / night
+    bands = {}
+    for b in d.findall("calculatedconditions/band"):
+        bands.setdefault(b.get("name", "?"), {})[b.get("time", "")] = (b.text or "").strip()
+    if bands:
+        color = lambda v: {"good": GOOD, "fair": FAIR, "poor": POOR}.get(v.lower(), DIM)
+        hf = ["<span style='color:#409EFF;'>HF</span> <span style='color:#9aa4b2;'>day/night</span>"]
+        for name, times in bands.items():
+            day, night = times.get("day", "?"), times.get("night", "?")
+            hf.append(f"<span style='color:#9aa4b2;'>{escape(name)}</span> "
+                      f"<span style='color:{color(day)};'>{escape(day)}</span>/"
+                      f"<span style='color:{color(night)};'>{escape(night)}</span>")
+        parts.append(" &nbsp;".join(hf))
+
+    # VHF outlook: aurora (NOAA model + Bz via KD2YFY.net), Kp forecast, 6m F2 / Es season.
+    # Each extra source may fail on its own without breaking the ticker.
+    now = datetime.now(timezone.utc)
+    lat = lon = None
+    try:
+        lat, lon, _ = lookup_location_cached(location)
+    except Exception:
+        pass
+    aurora = {}
+    try:
+        params = {"lat": round(lat, 1), "lon": round(lon, 1)} if lat is not None else None
+        aurora = requests.get(AURORA_URL, params=params, timeout=10, headers=_UA).json()
+    except Exception as e:
+        print(f"Aurora data error: {e!r}", file=sys.stderr)
+    bz30 = _num((aurora.get("bz30") or {}).get("avg"))
+    north = _num((aurora.get("aurora") or {}).get("north"))
+    try:
+        kp_fc = _kp_forecast_max()
+    except Exception as e:
+        print(f"Kp forecast error: {e!r}", file=sys.stderr)
+        kp_fc = None
+    is_day = sun_elevation(now, lat, lon) > 0 if lat is not None else 6 <= now.hour < 18
+    text, color = vhf_status(k, sfi, wind, bz30, north, kp_fc, is_day, now)
+    detail = []
+    if k is not None:
+        detail.append(f"Kp {k:.1f}")
+    if bz30 is not None:
+        detail.append(f"Bz 30m avg {bz30:+.1f} nT")
+    if north is not None:
+        detail.append(f"Aurora N {int(north)}%")
+    if kp_fc:
+        detail.append(f"Kp fcst max {kp_fc[0]:.1f} @ {kp_fc[1]:%H}Z")
+    parts.append(f"<span style='color:#409EFF;'>VHF</span> <span style='color:{color};'>{escape(text)}</span>"
+                 + (f" <span style='color:#9aa4b2;'>({escape(' · '.join(detail))})</span>" if detail else ""))
+
+    # HamQSL's sporadic-E / aurora flags
+    names = {("vhf-aurora", "northern_hemi"): "Aurora", ("e-skip", "north_america"): "2m Es NA",
+             ("e-skip", "europe"): "2m Es EU", ("e-skip", "europe_6m"): "6m Es EU",
+             ("e-skip", "europe_4m"): "4m Es EU"}
+    vhf = []
+    for ph in d.findall("calculatedvhfconditions/phenomenon"):
+        key = (ph.get("name", "").lower(), ph.get("location", "").lower())
+        label = names.get(key, f"{ph.get('name', '')} {ph.get('location', '')}".strip())
+        value = (ph.text or "").strip()
+        is_open = value and "closed" not in value.lower()
+        vhf.append(f"<span style='color:#9aa4b2;'>{escape(label)}</span> "
+                   f"<span style='color:{GOOD if is_open else DIM};'>"
+                   f"{escape(value if is_open else 'Closed')}</span>")
+    if vhf:
+        parts.append("<span style='color:#409EFF;'>Es</span> " + " &nbsp;".join(vhf))
+
+    updated = t("updated")
+    if updated:
+        parts.append(f"<span style='color:#666;'>Updated {escape(updated)} · N0NBH hamqsl.com</span>")
+    return sep.join(parts)
+
+
+class Ticker(QWidget):
+    """A line of coloured text that scrolls right-to-left and repeats."""
+    SPEEDS = {"slow": 30, "normal": 55, "fast": 90}  # pixels per second
+
+    def __init__(self, parent=None):
+        super().__init__(parent)
+        self.setObjectName("ticker")
+        self.setAttribute(Qt.WidgetAttribute.WA_TransparentForMouseEvents)  # drag the banner through it
+        self.doc = QTextDocument()
+        self.doc.setDocumentMargin(0)
+        self.doc.setDefaultStyleSheet("body { color: white; }")
+        self._html = None
+        self.offset = 0.0
+        self.speed = self.SPEEDS["normal"]
+        self.setFixedHeight(26)
+        self.timer = QTimer(self)
+        self.timer.timeout.connect(self._step)
+        self.timer.start(33)
+
+    def set_html(self, html, font):
+        if html == self._html:
+            return
+        self._html = html
+        self.doc.setDefaultFont(font)
+        self.doc.setHtml(f"<span style='white-space:nowrap;'>{html}</span>")
+        self.doc.setTextWidth(-1)
+        self.setFixedHeight(int(self.doc.size().height()) + 6)
+        self.update()
+
+    def set_speed(self, name):
+        self.speed = self.SPEEDS.get(name, self.SPEEDS["normal"])
+
+    def _step(self):
+        if self.isVisible() and self.doc.idealWidth() > 0:
+            self.offset = (self.offset + self.speed * 0.033) % (self.doc.idealWidth() + 120)
+            self.update()
+
+    def paintEvent(self, event):
+        p = QPainter(self)
+        p.setClipRect(self.rect())
+        width = self.doc.idealWidth() + 120  # gap before the text repeats
+        x = -self.offset
+        y = (self.height() - self.doc.size().height()) / 2
+        while x < self.width():
+            p.save()
+            p.translate(x, y)
+            self.doc.drawContents(p)
+            p.restore()
+            x += width
+        p.end()
+
+
 # ---------------------------------------------------------------- update ---
 
 def _version_tuple(v):
-    """'v1.2.3' -> (1, 2, 3); anything unparseable -> ()"""
-    try:
-        return tuple(int(x) for x in v.strip().lstrip("vV").split("."))
-    except ValueError:
+    """'v1.2.3' -> (1, 2, 3, 0); 'v1.3.0-beta.2' -> (1, 3, 0, -1, 2), which sorts below the
+    final 1.3.0; anything unparseable -> ()"""
+    m = re.match(r"^[vV]?(\d+(?:\.\d+)*)(?:-[A-Za-z]*\.?(\d*))?$", v.strip())
+    if not m:
         return ()
+    nums = tuple(int(x) for x in m.group(1).split("."))
+    if "-" in v:
+        return nums + (-1, int(m.group(2) or 0))
+    return nums + (0,)
 
 
 def _platform_zip():
@@ -557,6 +847,20 @@ class SettingsDialog(QDialog):
             self.auto_update.setToolTip("This copy can't update itself (installed with pipx or git).")
         form.addRow("Updates:", self.auto_update)
 
+        self.solar = QCheckBox("Show solar && band conditions ticker")
+        self.solar.setChecked(_yes(config.get("solar")))
+        self.solar.setToolTip("A scrolling line with SFI, A/K index, X-ray, solar wind and\n"
+                              "HF/VHF band conditions from N0NBH (hamqsl.com).")
+        form.addRow("Propagation:", self.solar)
+
+        self.ticker_speed = QComboBox()
+        self.ticker_speed.addItems(["Slow", "Normal", "Fast"])
+        self.ticker_speed.setCurrentText(config.get("ticker_speed").capitalize()
+                                         if config.get("ticker_speed").lower() in Ticker.SPEEDS else "Normal")
+        self.solar.toggled.connect(self.ticker_speed.setEnabled)
+        self.ticker_speed.setEnabled(self.solar.isChecked())
+        form.addRow("Ticker speed:", self.ticker_speed)
+
         self.on_top = QCheckBox("Always on top of other windows")
         self.on_top.setChecked(_yes(config.get("on_top")))
         self.on_top.setToolTip("When off, the banner acts like a normal window and gets a taskbar button.")
@@ -586,6 +890,8 @@ class SettingsDialog(QDialog):
         self.config.set("screens", "all" if self.screens.currentIndex() == 1 else "one")
         self.config.set("auto_update", "yes" if self.auto_update.isChecked() else "no")
         self.config.set("on_top", "yes" if self.on_top.isChecked() else "no")
+        self.config.set("solar", "yes" if self.solar.isChecked() else "no")
+        self.config.set("ticker_speed", self.ticker_speed.currentText().lower())
         if self.autostart.isChecked() != autostart_enabled():
             try:
                 set_autostart(self.autostart.isChecked())
@@ -615,6 +921,7 @@ class Controller(QObject):
     """Holds the settings, clock, weather and update state shared by every banner."""
     changed = pyqtSignal()
     _weather_ready = pyqtSignal(str)
+    _solar_ready = pyqtSignal(str)
     _update_found = pyqtSignal(dict)
     _update_ready = pyqtSignal(object)
     _update_failed = pyqtSignal(str)
@@ -661,6 +968,13 @@ class Controller(QObject):
         self.on_top_timer.start(2000)
         self.weather_timer = QTimer(self)
         self.weather_timer.timeout.connect(self.get_weather)
+        # Solar data changes every few hours at the source; hourly is plenty.
+        self.solar_html = "<span style='color:#888;'>☀ Loading solar &amp; band conditions…</span>"
+        self._solar_fetching = False
+        self._solar_ready.connect(self._on_solar)
+        self.solar_timer = QTimer(self)
+        self.solar_timer.timeout.connect(self.get_solar)
+        self.solar_timer.start(60 * 60 * 1000)
         # Check GitHub for a newer release shortly after start, then once a day.
         self.update_timer = QTimer(self)
         self.update_timer.timeout.connect(self.check_update)
@@ -711,6 +1025,9 @@ class Controller(QObject):
         self.weather_timer.start(max(5, _int(self.config.get("weather_refresh"), 30)) * 60000)
         if any(old.get(k) != self._applied[k] for k in ("location", "units")) or not old:
             self.get_weather()
+        if _yes(self._applied["solar"]) and (not old or not _yes(old.get("solar"))
+                                             or old.get("location") != self._applied["location"]):
+            self.get_solar()
         if old.get("screens") != self._applied["screens"]:
             self.layout_banners()
         if old and old.get("on_top") != self._applied["on_top"]:
@@ -810,6 +1127,31 @@ class Controller(QObject):
         self.weather_info = text
         self.changed.emit()
 
+    def get_solar(self):
+        if self._solar_fetching or not _yes(self.config.get("solar")):
+            return
+        self._solar_fetching = True
+        location = self.config.get("location")
+
+        def work():
+            try:
+                html = fetch_solar(location)
+            except Exception as e:
+                print(f"Solar data error: {e!r}", file=sys.stderr)
+                html = ("<span style='color:#888;'>☀ Solar &amp; band conditions unavailable - "
+                        "will try again soon</span>")
+            self._solar_ready.emit(html)
+
+        threading.Thread(target=work, daemon=True).start()
+
+    def _on_solar(self, html):
+        self._solar_fetching = False
+        if "unavailable" in html and "SFI" not in self.solar_html:
+            QTimer.singleShot(10 * 60 * 1000, self.get_solar)  # retry sooner after a failure
+        if "unavailable" not in html or "SFI" not in self.solar_html:
+            self.solar_html = html  # keep the last good report if a refresh fails
+        self.changed.emit()
+
     # --- updates ---
     def check_update(self):
         def work():
@@ -904,12 +1246,15 @@ class Banner(QWidget):
         main_layout.setSpacing(0)
 
         content = QWidget()
-        content_layout = QHBoxLayout(content)
+        content_layout = QVBoxLayout(content)
         content_layout.setContentsMargins(30, 15, 30, 10)
+        content_layout.setSpacing(4)
         self.label = QLabel("Initializing HUD...")
         self.label.setAlignment(Qt.AlignmentFlag.AlignCenter)
         self.label.setAttribute(Qt.WidgetAttribute.WA_TransparentForMouseEvents)
         content_layout.addWidget(self.label)
+        self.ticker = Ticker()
+        content_layout.addWidget(self.ticker)
         main_layout.addWidget(content)
 
         self.sizegrip = QSizeGrip(self)
@@ -923,11 +1268,21 @@ class Banner(QWidget):
                 font-family: 'Consolas', 'Menlo', 'DejaVu Sans Mono', monospace;
             }
             QLabel { border: none; background: transparent; color: white; }
+            #ticker { border: none; border-top: 1px solid #2a2a35; border-radius: 0; background: transparent; }
         """)
 
         ctl.changed.connect(self.update_display)
         self.update_display()
         self.restore_geometry()
+
+    @staticmethod
+    def ticker_font():
+        font = QFont("Consolas")
+        font.setStyleHint(QFont.StyleHint.Monospace)
+        font.setFamilies(["Consolas", "Menlo", "DejaVu Sans Mono", "monospace"])
+        font.setPixelSize(14)
+        font.setBold(True)
+        return font
 
     def apply_window_mode(self, show=True):
         """On top: stays above other windows, no taskbar button (use the tray icon).
@@ -959,6 +1314,14 @@ class Banner(QWidget):
 
     def update_display(self):
         c = self.ctl
+        show_solar = _yes(c.config.get("solar"))
+        if self.ticker.isVisibleTo(self) != show_solar:
+            self.ticker.setVisible(show_solar)
+            if not show_solar:  # shrink back to one line
+                self.resize(self.width(), self.minimumSizeHint().height())
+        if show_solar:
+            self.ticker.set_speed(c.config.get("ticker_speed").lower())
+            self.ticker.set_html(c.solar_html, self.ticker_font())
         utc_dt = QDateTime.currentDateTimeUtc()
         local_dt = QDateTime.currentDateTime().toTimeZone(c.tz)
         extra = ""

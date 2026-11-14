@@ -2,6 +2,8 @@
 # and publishes them on the Releases page.
 # To make a new release: Actions tab > "Build apps" > "Run workflow" > enter a
 # version like v1.2.0. (Pushing a tag like v1.2.0 does the same thing.)
+# A version with a dash, like v1.3.0-beta.1, becomes a test pre-release that nobody is
+# offered automatically.
 name: Build apps
 
 on:
@@ -76,6 +78,10 @@ jobs:
           tag_name: ${{ github.ref_type == 'tag' && github.ref_name || inputs.version }}
           target_commitish: ${{ github.sha }}
           name: Ham Radio Banner ${{ github.ref_type == 'tag' && github.ref_name || inputs.version }}
+          # Versions like v1.3.0-beta.1 are test builds: published as pre-releases, which the
+          # banner's update check ignores, so only people who download them by hand get them.
+          prerelease: ${{ contains(github.ref_type == 'tag' && github.ref_name || inputs.version, '-') }}
+          make_latest: ${{ !contains(github.ref_type == 'tag' && github.ref_name || inputs.version, '-') }}
           body: |
             Download the zip for your computer, unzip it, and double-click **HamRadioBanner**.
             No Python needed. See the README for first-run tips.
