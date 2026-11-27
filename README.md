@@ -84,7 +84,7 @@ The banner remembers its position and size between runs. A tray icon (an orange 
 
 ## Settings
 
-All settings can be changed from **Right-click → Settings…**, organized in tabs: **General** (callsign, timezone, screens, on top, dock, startup), **Weather**, **Station data**, **Propagation**, **Text sizes** and **Updates**.
+All settings can be changed from **Right-click → Settings…**, organized in tabs: **General** (callsign, timezone, screens, on top, dock, startup), **Weather**, **Station data**, **Propagation**, **News**, **Text sizes** and **Updates**.
 
 - **Callsign:** your amateur radio callsign.
 - **Local timezone:** start typing to search, e.g. `New_York` or `London`.
@@ -125,6 +125,11 @@ All settings can be changed from **Right-click → Settings…**, organized in t
 - **Install updates automatically:** install new versions without asking. See [Updating](#updating).
 - **Show solar & band conditions ticker:** off by default. When ticked, a second line scrolls under the clock. It shows SFI, sunspots, A and K index, X-ray, solar wind, Bz, geomagnetic field and noise. It also shows HF band conditions for day and night, and a VHF outlook: Aurora Likely or Watch, Possible 6m F2, E-skip Season, or Flat/Tropo. The VHF outlook is based on NOAA's aurora model, the 30-minute Bz and the Kp forecast, plus HamQSL's sporadic-E flags. Colors run green (good), yellow (fair) and red (poor). The data refreshes hourly.
 - **Ticker speed:** Slow, Normal or Fast.
+- **News ticker (News tab):** a second scrolling row with headlines from news feeds (RSS or Atom). It's off by default.
+  - **Feeds:** put one per line. A website's normal address works too, since the banner finds the feed the site advertises. You can put a short name first: `ARRL | https://www.arrl.org/arrl.rss`.
+  - **Starter feeds:** ARRL, Amateur Radio Newsline and DX-World are filled in. Delete them or add your own: local news, your club's site, NWS alerts, anything with a feed.
+  - **Display:** headlines from the different feeds take turns, each labelled with its source. A feed that can't be read shows *couldn't load* in the ticker.
+  - **Options:** set the number of headlines per feed, the refresh time and the scroll speed here, and the text size on the Text sizes tab.
 - **Always on top of other windows:** on by default. The banner stays above your other programs and has no taskbar button; use the tray icon to find it. Turn it off and the banner acts like a normal window with its own taskbar button.
 - **Dock to top of screen:** off by default. When ticked, the banner becomes a full-width bar across the top of the screen, like a taskbar. Other windows, even maximized ones, fit underneath it instead of covering it. Full-screen games and videos can still use the whole screen. Untick it and the banner goes back to where you had it. With *Show on: Every screen*, each monitor gets its own docked bar. Docking works on Windows and on most Linux desktops (X11). On a Mac it pins the banner under the menu bar, but macOS doesn't let apps reserve screen space, so other windows can still go over it.
 - **Start when the computer starts:** the banner opens by itself when you log in. This is on by default for new installs. Untick it to stop.

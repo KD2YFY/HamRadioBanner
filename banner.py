@@ -31,7 +31,7 @@ from PyQt6.QtWidgets import (
     QTimeEdit, QWidget,
 )
 
-__version__ = "1.6.8"  # must match the version typed when publishing a release
+__version__ = "1.7.0"  # must match the version typed when publishing a release
 APP_NAME = "HamRadioBanner"
 RELEASES_API = os.environ.get("HAMRADIOBANNER_RELEASES_API",  # override is for testing only
                               "https://api.github.com/repos/KD2YFY/HamRadioBanner/releases/latest")
@@ -65,6 +65,13 @@ DEFAULTS = {
     "auto_update": "no",      # yes = install new versions without asking
     "solar": "no",            # yes = scrolling solar/propagation ticker under the clock
     "ticker_speed": "normal", # slow, normal or fast
+    "rss": "no",              # yes = a scrolling news (RSS/Atom) ticker row
+    "rss_feeds": "ARRL | https://www.arrl.org/arrl.rss\nNewsline | https://www.arnewsline.org\n"
+                 "DX-World | https://www.dx-world.net",  # one per line: "Name | address" or just an address
+    "rss_items": "5",         # headlines per feed
+    "rss_refresh": "30",      # minutes
+    "rss_speed": "normal",    # slow, normal or fast
+    "font_news": "11",        #   news ticker text size
     "dock": "no",             # yes = full-width bar docked at the top; other windows stay below it
     "on_top": "yes",          # yes = stay above other windows; no = normal window with taskbar button
 }
@@ -101,7 +108,8 @@ class Config:
 
     def reload(self):
         """Re-read config.ini from disk (picks up edits made in a text editor)."""
-        self.parser = configparser.ConfigParser()
+        # interpolation=None: web addresses and API keys may contain "%" characters
+        self.parser = configparser.ConfigParser(interpolation=None)
         try:
             self.exists = bool(self.parser.read(self.path, encoding="utf-8"))
         except configparser.Error:
@@ -957,6 +965,109 @@ class Ticker(QWidget):
         p.end()
 
 
+# ------------------------------------------------------------------ news ---
+
+def parse_feed_lines(text):
+    """'ARRL | https://...' or a bare address, one per line -> [(name or '', url)]."""
+    feeds = []
+    for line in str(text).splitlines():
+        line = line.strip()
+        if not line or line.startswith("#"):
+            continue
+        name, _, url = line.rpartition("|") if "|" in line else ("", "", line)
+        url = url.strip()
+        if url and "://" not in url:
+            url = "https://" + url
+        if url:
+            feeds.append((name.strip(), url))
+    return feeds
+
+
+def _clean_text(text):
+    """Feed titles can contain HTML and entities; make them plain text."""
+    import html as _html
+    text = re.sub(r"<[^>]+>", "", _html.unescape(text or ""))
+    text = " ".join(text.split())
+    return text if len(text) <= 160 else text[:157].rstrip() + "…"
+
+
+def _get_limited(url, limit=3 * 1024 * 1024):
+    """Download at most `limit` bytes (feeds are small; this guards against huge pages)."""
+    r = requests.get(url, timeout=15, stream=True,
+                     headers={"User-Agent": f"{APP_NAME}/{__version__} (+https://github.com/KD2YFY/HamRadioBanner)",
+                              "Accept": "application/rss+xml, application/atom+xml, application/xml, text/xml, */*"})
+    r.raise_for_status()
+    data = b""
+    for chunk in r.iter_content(64 * 1024):
+        data += chunk
+        if len(data) > limit:
+            break
+    return r.url, data[:limit]
+
+
+def fetch_feed(url, max_items=5):
+    """Headlines from an RSS or Atom feed: (feed title, [headline, ...]). A website's normal
+    address works too: the feed it advertises (<link rel="alternate" ...>) is used."""
+    from urllib.parse import urljoin
+    final_url, data = _get_limited(url)
+    head = data[:2048].lstrip().lower()
+    if head.startswith(b"<!doctype html") or b"<html" in head:
+        page = data.decode("utf-8", "replace")
+        for tag in re.findall(r"<link\b[^>]*>", page, re.I):
+            if re.search(r"rel=[\"']?alternate", tag, re.I) and re.search(r"(rss|atom)\+xml", tag, re.I):
+                href = re.search(r"href=[\"']([^\"']+)", tag, re.I)
+                if href:
+                    final_url, data = _get_limited(urljoin(final_url, href.group(1)))
+                    break
+        else:
+            raise ValueError("no news feed found on that page")
+    root = ET.fromstring(data)
+    local = lambda el: el.tag.rsplit("}", 1)[-1].lower()
+    title, items = "", []
+    for el in root.iter():
+        name = local(el)
+        if name == "title" and not title and not items:
+            title = _clean_text(el.text)
+        elif name in ("item", "entry"):
+            t = next((_clean_text(c.text) for c in el if local(c) == "title"), "")
+            if t:
+                items.append(t)
+            if len(items) >= max_items:
+                break
+    if not items and local(root) not in ("rss", "feed", "rdf"):
+        raise ValueError("not an RSS or Atom feed")
+    return title, items
+
+
+def fetch_news(feed_text, max_items=5):
+    """Ticker HTML: headlines from every feed, taking turns so sources mix."""
+    feeds = parse_feed_lines(feed_text)
+    if not feeds:
+        return "<span style='color:#888;'>📰 No news feeds set - right-click &gt; Settings &gt; News</span>"
+    lists, errors = [], []
+    for name, url in feeds:
+        label = name or url.split("://", 1)[-1].split("/", 1)[0].removeprefix("www.")
+        try:
+            title, items = fetch_feed(url, max_items)
+            label = name or (title.split(" - ")[0].split(" | ")[0][:24] if title else label)
+            if items:
+                lists.append((label, items))
+            else:
+                errors.append(f"{label}: no headlines")
+        except Exception as e:
+            print(f"News feed {url} failed: {e!r}", file=sys.stderr)
+            errors.append(f"{label}: couldn't load")
+    parts = []
+    for i in range(max((len(items) for _, items in lists), default=0)):
+        for label, items in lists:
+            if i < len(items):
+                parts.append(f"<span style='color:#E6A23C;'>{escape(label)} ▸</span> "
+                             f"<span style='color:#ffffff;'>{escape(items[i])}</span>")
+    parts += [f"<span style='color:#888;'>{escape(e)}</span>" for e in errors]
+    sep = " <span style='color:#4a4a5a;'>&nbsp;•&nbsp;</span> "
+    return "<span style='color:#409EFF;'>📰 NEWS</span> " + sep.join(parts)
+
+
 # ---------------------------------------------------------------- update ---
 
 def _version_tuple(v):
@@ -1456,7 +1567,7 @@ def settings_style():
     return f"""
         QDialog {{ background: #1b1b22; }}
         QLabel, QCheckBox {{ color: #e6e6e6; font-size: 13px; }}
-        QLineEdit, QComboBox, QSpinBox, QTimeEdit {{
+        QLineEdit, QComboBox, QSpinBox, QTimeEdit, QPlainTextEdit {{
             background: #2a2a35; color: #ffffff; font-size: 13px;
             border: 1px solid #4a4a5a; border-radius: 5px; padding: 5px 8px; min-height: 18px;
         }}
@@ -1506,7 +1617,7 @@ class SettingsDialog(QDialog):
         self.setWindowTitle("Ham Radio Banner - Settings")
         self.setWindowFlag(Qt.WindowType.WindowStaysOnTopHint)
         self.setStyleSheet(settings_style())
-        self.setMinimumWidth(640)
+        self.setMinimumWidth(740)
         self.config = config
         layout = QVBoxLayout(self)
 
@@ -1544,6 +1655,9 @@ class SettingsDialog(QDialog):
         stations = tab("Station data", "Where the 24-hour high/low (and optionally the current temperature) "
                                        "comes from. NWS needs no account.")
         prop = tab("Propagation")
+        news = tab("News", "A second scrolling row with headlines from news feeds (RSS or Atom). "
+                                 "One per line. A website's normal address works too - the banner finds "
+                                 "its feed. Optional name first: ARRL | https://www.arrl.org/arrl.rss")
         sizes_form = tab("Text sizes", "Font sizes in points, like in a document (6-72). "
                                        "The banner resizes to fit.")
         updates = tab("Updates")
@@ -1668,7 +1782,8 @@ class SettingsDialog(QDialog):
         for i, (key, label) in enumerate((("font_callsign", "Callsign"), ("font_date", "Date"),
                                           ("font_clock", "Clock times"), ("font_clock_label", "Clock labels"),
                                           ("font_weather", "Temperatures"), ("font_weather_label", "WX labels"),
-                                          ("font_conditions", "Conditions"), ("font_ticker", "Ticker"))):
+                                          ("font_conditions", "Conditions"), ("font_ticker", "Solar ticker"),
+                                          ("font_news", "News ticker"))):
             box = QSpinBox()
             box.setRange(6, 72)
             box.setSuffix(" pt")
@@ -1713,6 +1828,33 @@ class SettingsDialog(QDialog):
         self.solar.toggled.connect(self.ticker_speed.setEnabled)
         self.ticker_speed.setEnabled(self.solar.isChecked())
         prop.addRow("Ticker speed:", self.ticker_speed)
+
+        from PyQt6.QtWidgets import QPlainTextEdit
+        self.rss = QCheckBox("Show news ticker")
+        self.rss.setChecked(_yes(config.get("rss")))
+        news.addRow("News:", self.rss)
+        self.rss_feeds = QPlainTextEdit(config.get("rss_feeds").replace("\\n", "\n"))
+        self.rss_feeds.setPlaceholderText("ARRL | https://www.arrl.org/arrl.rss\nhttps://www.dx-world.net")
+        self.rss_feeds.setFixedHeight(96)
+        self.rss_feeds.setLineWrapMode(QPlainTextEdit.LineWrapMode.NoWrap)
+        news.addRow("Feeds:", self.rss_feeds)
+        self.rss_items = QSpinBox()
+        self.rss_items.setRange(1, 20)
+        self.rss_items.setValue(max(1, min(20, _int(config.get("rss_items"), 5))))
+        news.addRow("Headlines per feed:", self.rss_items)
+        self.rss_refresh = QSpinBox()
+        self.rss_refresh.setRange(10, 240)
+        self.rss_refresh.setSuffix(" min")
+        self.rss_refresh.setValue(max(10, min(240, _int(config.get("rss_refresh"), 30))))
+        news.addRow("Refresh every:", self.rss_refresh)
+        self.rss_speed = QComboBox()
+        self.rss_speed.addItems(["Slow", "Normal", "Fast"])
+        self.rss_speed.setCurrentText(config.get("rss_speed").capitalize()
+                                      if config.get("rss_speed").lower() in Ticker.SPEEDS else "Normal")
+        news.addRow("Ticker speed:", self.rss_speed)
+        for w in (self.rss_feeds, self.rss_items, self.rss_refresh, self.rss_speed):
+            w.setEnabled(self.rss.isChecked())
+            self.rss.toggled.connect(w.setEnabled)
 
         self.on_top = QCheckBox("Always on top of other windows")
         self.on_top.setChecked(_yes(config.get("on_top")))
@@ -1932,6 +2074,12 @@ class SettingsDialog(QDialog):
         self.config.set("dock", "yes" if self.dock.isChecked() else "no")
         self.config.set("solar", "yes" if self.solar.isChecked() else "no")
         self.config.set("ticker_speed", self.ticker_speed.currentText().lower())
+        self.config.set("rss", "yes" if self.rss.isChecked() else "no")
+        feeds = "\n".join(l.strip() for l in self.rss_feeds.toPlainText().splitlines() if l.strip())
+        self.config.set("rss_feeds", feeds)
+        self.config.set("rss_items", self.rss_items.value())
+        self.config.set("rss_refresh", self.rss_refresh.value())
+        self.config.set("rss_speed", self.rss_speed.currentText().lower())
         if self.autostart.isChecked() != autostart_enabled():
             try:
                 set_autostart(self.autostart.isChecked())
@@ -1962,6 +2110,7 @@ class Controller(QObject):
     changed = pyqtSignal()
     _weather_ready = pyqtSignal(object)
     _solar_ready = pyqtSignal(str)
+    _news_ready = pyqtSignal(str)
     _update_found = pyqtSignal(dict)
     _manual_check_done = pyqtSignal(object, object)
     _update_ready = pyqtSignal(object)
@@ -2027,6 +2176,11 @@ class Controller(QObject):
         self.solar_timer = QTimer(self)
         self.solar_timer.timeout.connect(self.get_solar)
         self.solar_timer.start(60 * 60 * 1000)
+        self.news_html = "<span style='color:#888;'>📰 Loading news…</span>"
+        self._news_fetching = False
+        self._news_ready.connect(self._on_news)
+        self.news_timer = QTimer(self)
+        self.news_timer.timeout.connect(self.get_news)
         # Check GitHub for a newer release shortly after start, then once a day.
         self.update_timer = QTimer(self)
         self.update_timer.timeout.connect(self.check_update)
@@ -2086,8 +2240,12 @@ class Controller(QObject):
         if old and any(old.get(k) != self._applied[k] for k in
                        ("font_callsign", "font_clock", "font_weather", "font_ticker", "show_weather",
                         "font_clock_label", "font_weather_label", "font_date", "font_conditions",
-                        "show_conditions")):
+                        "show_conditions", "rss", "font_news", "solar")):
             QTimer.singleShot(0, lambda: [b.refit() for b in self.banners.values()])
+        self.news_timer.start(max(10, _int(self.config.get("rss_refresh"), 30)) * 60000)
+        if _yes(self._applied["rss"]) and (not old or any(old.get(k) != self._applied[k]
+                                                          for k in ("rss", "rss_feeds", "rss_items"))):
+            self.get_news()
         if _yes(self._applied["solar"]) and (not old or not _yes(old.get("solar"))
                                              or old.get("location") != self._applied["location"]):
             self.get_solar()
@@ -2312,6 +2470,29 @@ class Controller(QObject):
             self.solar_html = html  # keep the last good report if a refresh fails
         self.changed.emit()
 
+    def get_news(self):
+        if self._news_fetching or not _yes(self.config.get("rss")):
+            return
+        self._news_fetching = True
+        feeds = self.config.get("rss_feeds")
+        n = max(1, min(20, _int(self.config.get("rss_items"), 5)))
+
+        def work():
+            try:
+                html = fetch_news(feeds, n)
+            except Exception as e:
+                print(f"News error: {e!r}", file=sys.stderr)
+                html = "<span style='color:#888;'>📰 News unavailable - will try again soon</span>"
+            self._news_ready.emit(html)
+
+        threading.Thread(target=work, daemon=True).start()
+
+    def _on_news(self, html):
+        self._news_fetching = False
+        if "▸" in html or "▸" not in self.news_html:
+            self.news_html = html  # keep the last good headlines if every feed failed this time
+        self.changed.emit()
+
     # --- updates ---
     def check_update(self, manual=False, done=None):
         """Look for a newer release. Automatic checks are silent; a manual check (menu or
@@ -2468,6 +2649,8 @@ class Banner(QWidget):
         content_layout.addWidget(self.label)
         self.ticker = Ticker()
         content_layout.addWidget(self.ticker)
+        self.news = Ticker()  # RSS headlines, a second scrolling row
+        content_layout.addWidget(self.news)
         main_layout.addWidget(content)
 
         self.sizegrip = QSizeGrip(self)
@@ -2699,6 +2882,16 @@ class Banner(QWidget):
         if show_solar:
             self.ticker.set_speed(c.config.get("ticker_speed").lower())
             self.ticker.set_html(c.solar_html, self.ticker_font(c.font_pt("ticker")))
+        show_news = _yes(c.config.get("rss"))
+        if self.news.isVisibleTo(self) != show_news:
+            self.news.setVisible(show_news)
+            if not show_news:
+                self.resize(self.width(), self.minimumSizeHint().height())
+            if self.is_docked:
+                QTimer.singleShot(0, self._redock)
+        if show_news:
+            self.news.set_speed(c.config.get("rss_speed").lower())
+            self.news.set_html(c.news_html, self.ticker_font(c.font_pt("news")))
         utc_dt = QDateTime.currentDateTimeUtc()
         local_dt = QDateTime.currentDateTime().toTimeZone(c.tz)
         # Each part has its own font size in points. The main text of a part (callsign, the
