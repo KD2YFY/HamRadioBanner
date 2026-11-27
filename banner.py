@@ -31,7 +31,7 @@ from PyQt6.QtWidgets import (
     QTimeEdit, QWidget,
 )
 
-__version__ = "1.7.0"  # must match the version typed when publishing a release
+__version__ = "1.7.1"  # must match the version typed when publishing a release
 APP_NAME = "HamRadioBanner"
 RELEASES_API = os.environ.get("HAMRADIOBANNER_RELEASES_API",  # override is for testing only
                               "https://api.github.com/repos/KD2YFY/HamRadioBanner/releases/latest")
@@ -917,10 +917,16 @@ class Ticker(QWidget):
     """A line of coloured text that scrolls right-to-left and repeats."""
     SPEEDS = {"slow": 30, "normal": 55, "fast": 90}  # pixels per second
 
-    def __init__(self, parent=None):
+    def __init__(self, parent=None, clickable=False):
         super().__init__(parent)
         self.setObjectName("ticker")
-        self.setAttribute(Qt.WidgetAttribute.WA_TransparentForMouseEvents)  # drag the banner through it
+        self.clickable = clickable
+        self._hover = False
+        self._press = None
+        if clickable:
+            self.setMouseTracking(True)  # to show a hand over headlines and pause while hovering
+        else:
+            self.setAttribute(Qt.WidgetAttribute.WA_TransparentForMouseEvents)  # drag the banner through it
         self.doc = QTextDocument()
         self.doc.setDocumentMargin(0)
         self.doc.setDefaultStyleSheet("body { color: white; }")
@@ -946,9 +952,69 @@ class Ticker(QWidget):
         self.speed = self.SPEEDS.get(name, self.SPEEDS["normal"])
 
     def _step(self):
+        if self._hover:
+            return  # hold still while the mouse is over the row, so headlines are easy to click
         if self.isVisible() and self.doc.idealWidth() > 0:
             self.offset = (self.offset + self.speed * 0.033) % (self.doc.idealWidth() + 120)
             self.update()
+
+    # --- clickable headlines (news row) ---
+    def _anchor_at(self, pos):
+        """The link under a point in the scrolling row, or ''."""
+        from PyQt6.QtCore import QPointF
+        width = self.doc.idealWidth()
+        if width <= 0:
+            return ""
+        x = (pos.x() + self.offset) % (width + 120)
+        y = pos.y() - (self.height() - self.doc.size().height()) / 2
+        if x > width:
+            return ""  # in the gap before the text repeats
+        href = self.doc.documentLayout().anchorAt(QPointF(x, y))
+        return href if href.startswith(("http://", "https://")) else ""
+
+    def enterEvent(self, event):
+        self._hover = self.clickable
+        super().enterEvent(event)
+
+    def leaveEvent(self, event):
+        self._hover = False
+        self.unsetCursor()
+        super().leaveEvent(event)
+
+    def mouseMoveEvent(self, event):
+        href = self._anchor_at(event.position())
+        if href:
+            self.setCursor(Qt.CursorShape.PointingHandCursor)
+        else:
+            self.unsetCursor()
+        self.setToolTip(href)
+        event.ignore()  # let the banner handle drags
+
+    def mousePressEvent(self, event):
+        href = self._anchor_at(event.position()) if event.button() == Qt.MouseButton.LeftButton else ""
+        if href:
+            self._press = (href, event.position())
+            event.accept()
+        else:
+            self._press = None
+            event.ignore()  # not on a headline: the banner gets it (drag to move)
+
+    def mouseReleaseEvent(self, event):
+        if self._press:
+            href, start = self._press
+            self._press = None
+            moved = (event.position() - start).manhattanLength()
+            if moved < 6 and self._anchor_at(event.position()) == href:
+                QDesktopServices.openUrl(QUrl(href))  # read more in the web browser
+            event.accept()
+        else:
+            event.ignore()
+
+    def mouseDoubleClickEvent(self, event):
+        if self._anchor_at(event.position()):
+            event.accept()  # a double-click on a headline shouldn't open Settings
+        else:
+            event.ignore()
 
     def paintEvent(self, event):
         p = QPainter(self)
@@ -1006,7 +1072,7 @@ def _get_limited(url, limit=3 * 1024 * 1024):
 
 
 def fetch_feed(url, max_items=5):
-    """Headlines from an RSS or Atom feed: (feed title, [headline, ...]). A website's normal
+    """Headlines from an RSS or Atom feed: (feed title, [(headline, link), ...]). A website's normal
     address works too: the feed it advertises (<link rel="alternate" ...>) is used."""
     from urllib.parse import urljoin
     final_url, data = _get_limited(url)
@@ -1030,8 +1096,22 @@ def fetch_feed(url, max_items=5):
             title = _clean_text(el.text)
         elif name in ("item", "entry"):
             t = next((_clean_text(c.text) for c in el if local(c) == "title"), "")
+            link = ""
+            for c in el:
+                if local(c) != "link":
+                    continue
+                if c.get("href") and c.get("rel", "alternate") == "alternate":  # Atom
+                    link = c.get("href")
+                    break
+                if (c.text or "").strip():  # RSS
+                    link = c.text.strip()
+                    break
+            if not link:  # some RSS feeds only give the article address as a permalink guid
+                link = next(((c.text or "").strip() for c in el if local(c) == "guid"
+                             and c.get("isPermaLink", "true") != "false"), "")
+            link = urljoin(final_url, link) if link else ""
             if t:
-                items.append(t)
+                items.append((t, link if link.startswith(("http://", "https://")) else ""))
             if len(items) >= max_items:
                 break
     if not items and local(root) not in ("rss", "feed", "rdf"):
@@ -1061,8 +1141,12 @@ def fetch_news(feed_text, max_items=5):
     for i in range(max((len(items) for _, items in lists), default=0)):
         for label, items in lists:
             if i < len(items):
-                parts.append(f"<span style='color:#E6A23C;'>{escape(label)} ▸</span> "
-                             f"<span style='color:#ffffff;'>{escape(items[i])}</span>")
+                headline, link = items[i]
+                text = f"<span style='color:#ffffff;'>{escape(headline)}</span>"
+                if link:  # clickable: opens the article in the web browser
+                    text = (f"<a href='{escape(link, quote=True)}' style='color:#ffffff; "
+                            f"text-decoration:none;'>{escape(headline)}</a>")
+                parts.append(f"<span style='color:#E6A23C;'>{escape(label)} ▸</span> {text}")
     parts += [f"<span style='color:#888;'>{escape(e)}</span>" for e in errors]
     sep = " <span style='color:#4a4a5a;'>&nbsp;•&nbsp;</span> "
     return "<span style='color:#409EFF;'>📰 NEWS</span> " + sep.join(parts)
@@ -2649,7 +2733,7 @@ class Banner(QWidget):
         content_layout.addWidget(self.label)
         self.ticker = Ticker()
         content_layout.addWidget(self.ticker)
-        self.news = Ticker()  # RSS headlines, a second scrolling row
+        self.news = Ticker(clickable=True)  # RSS headlines, a second scrolling row; click to read
         content_layout.addWidget(self.news)
         main_layout.addWidget(content)
 
